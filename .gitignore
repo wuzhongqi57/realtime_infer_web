@@ -1,0 +1,22 @@
+﻿__pycache__/
+*.pyc
+*.pyo
+output/
+.DS_Store
+Thumbs.db
+*.egg-info/
+.eggs/
+venv/
+env/
+.venv/
+
+# Model weights (keep local / E:\wuzq\models — see README)
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+models/
+
+# Local backups
+*.bak
+*.bak_*

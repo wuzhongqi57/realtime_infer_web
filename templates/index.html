@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>IR 实时推理模拟</title>
+<style>
+  :root {
+    --bg: #14141f;
+    --panel: #1d1d2e;
+    --border: #33334a;
+    --text: #e6e6f0;
+    --dim: #8a8aa0;
+    --accent: #00d4aa;
+    --bad: #e05555;
+    --warn: #f0a030;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font-family: "Consolas", "Microsoft YaHei", monospace;
+    height: 100vh; display: flex; flex-direction: column;
+  }
+  header {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--border);
+  }
+  header h1 { font-size: 16px; font-weight: 600; }
+  .badge {
+    font-size: 12px; padding: 3px 10px; border-radius: 12px;
+    border: 1px solid var(--border); color: var(--dim); white-space: nowrap;
+  }
+  .badge.ok { color: var(--accent); border-color: var(--accent); }
+  .badge.warn { color: var(--warn); border-color: var(--warn); }
+  .badge.bad { color: var(--bad); border-color: var(--bad); }
+  .count-ctl {
+    display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--dim);
+    margin-left: auto;
+  }
+  .count-ctl select {
+    background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: 4px;
+    padding: 2px 6px; font-size: 12px; font-family: inherit;
+  }
+  .tools { display: flex; gap: 6px; margin-left: 10px; align-items: center; }
+  .tools .fmt-ctl {
+    display: flex; align-items: center; gap: 3px; font-size: 0.75rem; color: var(--text-dim);
+  }
+  .tools .fmt-ctl select {
+    background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: 4px;
+    padding: 2px 5px; font-size: 0.72rem; font-family: inherit;
+  }
+  .tools button {
+    padding: 4px 10px; font-size: 0.78rem; border: 1px solid var(--border);
+    border-radius: 6px; background: var(--panel); color: var(--text); cursor: pointer;
+  }
+  .tools button:hover { border-color: var(--accent); }
+  .tools button.rec { color: #fff; background: #c0392b; border-color: #c0392b; }
+  .tools button.off { color: var(--warn); border-color: var(--warn); }
+  .toast {
+    position: fixed; top: 54px; right: 14px; z-index: 999;
+    max-width: 380px; padding: 9px 14px; font-size: 0.78rem; line-height: 1.5;
+    background: var(--panel); border: 1px solid var(--border); border-left: 3px solid var(--accent);
+    border-radius: 6px; color: var(--text); box-shadow: 0 3px 12px rgba(0,0,0,0.35);
+    opacity: 0; transform: translateY(-6px); transition: opacity .25s, transform .25s;
+    white-space: pre-line; pointer-events: none;
+  }
+  .toast.ok { opacity: 1; transform: translateY(0); border-left-color: var(--accent); }
+  .toast.err { opacity: 1; transform: translateY(0); border-left-color: #e74c3c; }
+  #main { flex: 1; display: flex; gap: 12px; padding: 12px; min-height: 0; }
+  .panel {
+    flex: 1; min-width: 0;
+    display: flex; flex-direction: column;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+    overflow: hidden;
+  }
+  .panel .title {
+    padding: 8px 12px; font-size: 13px; color: var(--dim);
+    border-bottom: 1px solid var(--border);
+    display: flex; justify-content: space-between; align-items: center; gap: 8px;
+  }
+  .panel .title select {
+    background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: 4px;
+    padding: 3px 6px; font-size: 12px; font-family: inherit;
+    max-width: 60%;
+  }
+  .panel .stage {
+    flex: 1; display: flex; align-items: center; justify-content: center;
+    min-height: 0; padding: 8px;
+  }
+  canvas { max-width: 100%; max-height: 100%; background: #000; }
+  footer {
+    padding: 6px 16px; font-size: 12px; color: var(--dim);
+    background: var(--panel); border-top: 1px solid var(--border);
+    min-height: 30px; display: flex; align-items: center; gap: 16px;
+  }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+  .dot.ok { background: var(--accent); }
+  .dot.warn { background: var(--warn); }
+  .dot.bad { background: var(--bad); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>IR 实时推理模拟</h1>
+  <span class="badge warn" id="b-cam" data-label="摄像头">摄像头: 连接中</span>
+  <span class="badge" id="b-model" data-label="模型">模型: 待加载</span>
+  <span class="tools">
+    <label class="fmt-ctl">📷
+      <select id="snap-fmt">
+        <option value="png" selected>PNG</option>
+        <option value="jpg">JPG</option>
+      </select>
+    </label>
+    <button id="btn-snap" title="保存当前画面">📷 拍照</button>
+    <label class="fmt-ctl">●
+      <select id="rec-fmt">
+        <option value="avi" selected>AVI</option>
+        <option value="mp4">MP4</option>
+      </select>
+    </label>
+    <button id="btn-record" title="开始/停止录像">● 录像</button>
+    <button id="btn-cam-toggle" title="断开/重新连接摄像头">🔌 断开相机</button>
+  </span>
+</header>
+
+<main id="main"></main>
+
+<footer>
+  <span id="cam-detail"><span class="dot warn"></span>等待视频源</span>
+</footer>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const mainEl = $('main');
+
+  // ---- 面板流（每条 WebSocket 对应一个面板）----
+  function createPanel(select, canvas, ctx) {
+    let ws = null, current = null, closed = false;
+
+    // 缩放算法按显示内容决定：原图→最近邻，模型→双线性
+    function applyDisplayMode() {
+      const isRaw = (current === '原图');
+      ctx.imageSmoothingEnabled = !isRaw;
+      canvas.style.imageRendering = isRaw ? 'pixelated' : 'auto';
+    }
+
+    function open() {
+      if (closed) return;
+      ws = new WebSocket(`ws://${location.host}/ws/panel`);
+      ws.binaryType = 'arraybuffer';
+      ws.onopen = () => { if (current) ws.send(JSON.stringify({ model: current })); };
+      ws.onmessage = e => {
+        if (typeof e.data === 'string') return;
+        const blob = new Blob([e.data], { type: 'image/jpeg' });
+        createImageBitmap(blob).then(bmp => {
+          applyDisplayMode();
+          ctx.drawImage(bmp, 0, 0, canvas.width, canvas.height);   // 统一缩放到固定面板尺寸
+          bmp.close();
+        }).catch(() => {});
+      };
+      ws.onclose = () => { if (!closed) setTimeout(open, 1000); };
+      ws.onerror = () => ws.close();
+    }
+
+    select.addEventListener('change', () => {
+      current = select.value;
+      applyDisplayMode();
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ model: current }));
+      }
+    });
+
+    open();
+    return {
+      setModel: m => { current = m; select.value = m; applyDisplayMode(); },
+      getModel: () => current,
+      close: () => { closed = true; if (ws) ws.close(); }
+    };
+  }
+
+  // ---- 全局状态 ----
+  let currentOptions = [];        // 当前可选模型名（不含"原图"）
+  let lastCamKey = null;
+  let lastPanelSize = null;       // 固定面板尺寸 [W,H]
+  let panels = [];                // { el, select, canvas, ctx, api }
+
+  // ---- 面板增删（1~3 个）----
+  function fillSelect(select) {
+    const options = ['原图'].concat(currentOptions);
+    select.innerHTML = options.map(m => `<option value="${m}">${m}</option>`).join('');
+  }
+  function applyPanelSize(canvas) {
+    if (lastPanelSize && lastPanelSize[0]) {
+      canvas.width = lastPanelSize[0];
+      canvas.height = lastPanelSize[1];
+    }
+  }
+  function addPanel() {
+    const n = panels.length + 1;
+    const el = document.createElement('div');
+    el.className = 'panel';
+    el.innerHTML =
+      `<div class="title"><span>面板 ${n}</span><select></select></div>` +
+      `<div class="stage"><canvas width="1024" height="768"></canvas></div>`;
+    mainEl.appendChild(el);
+    const select = el.querySelector('select');
+    const canvas = el.querySelector('canvas');
+    const ctx = canvas.getContext('2d');
+    const api = createPanel(select, canvas, ctx);
+    fillSelect(select);
+    applyPanelSize(canvas);
+    // 默认：面板1=原图，其余=第一个匹配模型
+    api.setModel(n === 1 ? '原图' : (currentOptions.length ? currentOptions[0] : '原图'));
+    panels.push({ el, select, canvas, ctx, api });
+  }
+  function removePanel() {
+    const p = panels.pop();
+    if (p.api.close) p.api.close();
+    p.el.remove();
+  }
+  function setPanelCount(n) {
+    n = Math.max(1, Math.min(3, n));
+    while (panels.length < n) addPanel();
+    while (panels.length > n) removePanel();
+  }
+
+  // ---- 模型列表刷新（相机分辨率变化时重新匹配）----
+  async function refreshModels() {
+    let models = [], camSize = null, panelSize = null;
+    try {
+      const r = await fetch('/api/models');
+      const data = await r.json();
+      models = data.models || [];
+      camSize = data.camera_size;
+      panelSize = data.panel_size;
+    } catch (_) { return camSize; }
+    currentOptions = models;
+    if (panelSize && panelSize[0]) lastPanelSize = panelSize;
+
+    // 固定面板尺寸 + 重建所有下拉表（保留仍有效的选择）
+    const options = ['原图'].concat(models);
+    for (const p of panels) {
+      applyPanelSize(p.canvas);
+      const prev = p.select.value;
+      p.select.innerHTML = options.map(m => `<option value="${m}">${m}</option>`).join('');
+      if (prev === '原图' || models.includes(prev)) p.select.value = prev;
+    }
+    // 面板当前选择失效时回退到原图
+    for (const p of panels) {
+      if (p.api.getModel() !== '原图' && !models.includes(p.api.getModel())) {
+        p.api.setModel('原图');
+      }
+    }
+
+    if (camSize && camSize[0]) {
+      $('b-cam').className = 'badge ok';
+      $('b-cam').textContent = '摄像头: ' + camSize[0] + '×' + camSize[1];
+    }
+    const sizeTxt = camSize && camSize[0] ? camSize[0] + '×' + camSize[1] : '?';
+    $('b-model').className = 'badge ' + (models.length ? 'ok' : 'bad');
+    $('b-model').textContent = '模型: ' + (models.length
+      ? models.length + ' 个（匹配 ' + sizeTxt + '）' : '无');
+    return camSize;
+  }
+
+  async function init() {
+    const camSize = await refreshModels();       // 服务端会等相机确定分辨率（最多 5s）
+    lastCamKey = camSize && camSize[0] ? camSize.join('x') : '?';
+    setPanelCount(2);                            // 默认 2 面板
+  }
+
+  // ---- 摄像头状态轮询（含分辨率变化 → 重新匹配模型）----
+  let lastSeq = null, noFramePolls = 0;
+  async function poll() {
+    try {
+      const s = await (await fetch('/api/status', { cache: 'no-store' })).json();
+      const seq = s.raw_seq || 0;
+      if (lastSeq === null) lastSeq = seq;
+      if (seq > lastSeq) { lastSeq = seq; noFramePolls = 0; }
+      else noFramePolls++;
+      const hasCam = s.camera_size && s.camera_size[0] > 0;
+      const camOk = hasCam && noFramePolls < 8;   // 连续 8 次(16s)无新帧视为离线
+      const size = hasCam ? s.camera_size[0] + '×' + s.camera_size[1] : '?';
+      $('b-cam').className = 'badge ' + (camOk ? 'ok' : 'bad');
+      $('b-cam').textContent = '摄像头: ' + size + (camOk ? '' : ' 离线');
+      $('cam-detail').innerHTML =
+        `<span class="dot ${camOk ? 'ok' : 'warn'}"></span>` +
+        (camOk ? `视频源正常 (${size})` : '等待视频源');
+
+      // 相机分辨率变化（重插/更换）→ 重新匹配模型
+      const key = (s.camera_size || []).join('x') || '?';
+      if (key !== lastCamKey) {
+        lastCamKey = key;
+        if (key !== '?') refreshModels();
+      }
+    } catch (_) {}
+  }
+
+  // 面板固定为 2（原图 + 模型对比）；panel-count 下拉已废弃移除
+
+  // ---- 工具栏：拍照 / 录像 / 断开相机 ----
+  // toast 提示（右上角，3.5s 自动消失）
+  const toastEl = document.createElement('div');
+  toastEl.id = 'toast'; toastEl.className = 'toast';
+  document.body.appendChild(toastEl);
+  let toastTimer = null;
+  function toast(msg, ok) {
+    toastEl.textContent = msg;
+    toastEl.className = 'toast ' + (ok ? 'ok' : 'err');
+    if (toastTimer) clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => { toastEl.className = 'toast'; }, 3500);
+  }
+  function apiPost(path, body) {
+    return fetch(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: body ? JSON.stringify(body) : undefined,
+    }).then(r => r.json());
+  }
+  function setFoot(msg, ok) {
+    $('cam-detail').innerHTML = `<span class="dot ${ok ? 'ok' : 'warn'}"></span>${msg}`;
+  }
+
+  // 拍照：保存所有面板的画面（去重，含算法结果），格式可选 PNG/JPG
+  $('btn-snap').addEventListener('click', async () => {
+    try {
+      const models = [...new Set(panels.map(p => p.api.getModel()))];
+      if (!models.length) { toast('无面板', false); return; }
+      const fmt = $('snap-fmt').value;
+      const rs = await Promise.all(models.map(m => apiPost('/api/snapshot', { model: m, format: fmt })));
+      const files = rs.filter(r => r.status === 'ok');
+      if (files.length) {
+        const names = files.map(f => f.model).join(', ');
+        toast(`已保存 ${files.length} 张 (${fmt.toUpperCase()}) → ${files[0].file}\n(${names})`, true);
+        setFoot(`已保存 ${files.length} 张`, true);
+      } else {
+        toast('拍照失败: ' + ((rs[0] && rs[0].message) || '未知错误'), false);
+      }
+    } catch (e) { toast('拍照失败: ' + e.message, false); }
+  });
+
+  // 录像：同时录制所有面板的视频（每面板一路），格式可选 AVI/MP4
+  $('btn-record').addEventListener('click', async () => {
+    const btn = $('btn-record');
+    try {
+      if (btn.dataset.rec === '1') {
+        const r = await apiPost('/api/recording/stop');
+        btn.dataset.rec = '0'; btn.textContent = '● 录像'; btn.classList.remove('rec');
+        const cnt = (r.files && r.files.length) || 0;
+        toast(`录像已保存 ${cnt} 路 (${r.files ? r.files[0].frames : 0} 帧/路)`, true);
+        setFoot(`录像已保存 ${cnt} 路`, true);
+      } else {
+        const models = [...new Set(panels.map(p => p.api.getModel()))];
+        const fmt = $('rec-fmt').value;
+        const r = await apiPost('/api/recording/start', { models: models, format: fmt });
+        if (r.status === 'ok') {
+          btn.dataset.rec = '1'; btn.textContent = '■ 停止录像'; btn.classList.add('rec');
+          toast(`录像中 ${r.models.length} 路 (${fmt.toUpperCase()}) → ${r.files[0]}`, true);
+          setFoot(`录像中 ${r.models.length} 路...`, true);
+        } else {
+          toast('录像启动失败: ' + r.message, false);
+        }
+      }
+    } catch (e) { toast('录像操作失败: ' + e.message, false); }
+  });
+
+  // 断开 / 重连相机
+  $('btn-cam-toggle').addEventListener('click', async () => {
+    const btn = $('btn-cam-toggle');
+    try {
+      const off = btn.dataset.off === '1';
+      const r = await apiPost('/api/camera/' + (off ? 'reconnect' : 'disconnect'));
+      if (r.status === 'ok') {
+        btn.dataset.off = off ? '0' : '1';
+        btn.textContent = off ? '🔌 断开相机' : '🔌 连接相机';
+        btn.classList.toggle('off', !off);
+        toast(off ? '已重新连接相机' : '已断开相机', true);
+        if (off) refreshModels();   // 重连后拉最新模型列表
+      }
+    } catch (e) { toast('相机操作失败: ' + e.message, false); }
+  });
+
+  init();
+  poll();
+  setInterval(poll, 2000);
+})();
+</script>
+</body>
+</html>
