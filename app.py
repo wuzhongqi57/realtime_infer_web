@@ -7,7 +7,8 @@
   - /ws/panel：每个面板一条 WebSocket，客户端可发送 {"model": <名字>} 切换
   - /api/models：返回可选模型列表
   - 同一模型同一帧的推理结果跨面板共享（ModelHub 帧缓存）
-  - 原图 256×192 由前端最近邻放大到面板分辨率（1024×768）
+  - 跨分辨率支持：相机帧自动缩放到模型输入尺寸再推理，SR 结果再缩放到面板尺寸
+  - 面板尺寸 = 相机分辨率 × 最大放大倍数（原图最近邻放大，模型结果平滑缩放）
 """
 
 import argparse
@@ -76,15 +77,20 @@ def _jpeg(frame: np.ndarray) -> bytes:
 
 def _render(name: str, frame: np.ndarray, seq: int) -> bytes:
     """按面板选择渲染一帧为 JPEG。
-    - '原图'：最近邻缩放到面板固定尺寸（与 SR 输出同尺寸，对比更明显）
-    - 模型名：推理后发超分结果（本身就是面板尺寸）
+
+    - '原图'：最近邻缩放到面板固定尺寸（像素感，便于对比）
+    - 模型名：推理后缩放到面板尺寸（跨分辨率模型用平滑缩放）
     """
+    panel_w, panel_h = _get_panel_size()
     if name == config.RAW_LABEL:
-        w, h = _get_panel_size()
-        if h and (frame.shape != (h, w)):
-            frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_NEAREST)
+        if panel_h and (frame.shape[:2] != (panel_h, panel_w)):
+            frame = cv2.resize(frame, (panel_w, panel_h), interpolation=cv2.INTER_NEAREST)
         return _jpeg(frame)
     sr, _ = hub.infer(name, frame, seq)
+    sr_h, sr_w = sr.shape[:2]
+    if panel_h and (sr_h, sr_w) != (panel_h, panel_w):
+        interp = cv2.INTER_AREA if sr_h > panel_h else cv2.INTER_LINEAR
+        sr = cv2.resize(sr, (panel_w, panel_h), interpolation=interp)
     return _jpeg(sr)
 
 
@@ -133,16 +139,12 @@ def index():
 
 
 def matching_models() -> list[str]:
-    """按当前相机分辨率过滤出匹配的模型（模型输入尺寸 == 相机尺寸）。
+    """返回所有可用模型。
 
-    相机未知或尺寸非标（无精确匹配）时全部列出，避免下拉表为空。
+    跨分辨率支持：无论相机分辨率如何，所有模型都可选择。
+    推理时会自动将相机帧缩放到模型期望的输入尺寸。
     """
-    w, h = state.cam_size
-    if not w:
-        return hub.names
-    exact = [info["name"] for info in hub.infos
-             if resolve_input_size(info["name"]) == (w, h)]
-    return exact if exact else hub.names
+    return hub.names
 
 
 @app.route("/api/models")
@@ -257,16 +259,19 @@ def api_recording_start():
     frame, seq = state.get_raw()
     if frame is None:
         return jsonify({"status": "error", "message": "当前无帧（相机未连接）"}), 400
-    h, w = frame.shape[:2]
+    cam_h, cam_w = frame.shape[:2]
     _ensure_dir(RECORDING_DIR)
     ts = _timestamp()
     for model in models:
-        # 每路 writer 用该路输出尺寸：原图=raw 尺寸，模型=SR 尺寸（scale×输入）
+        # 每路 writer 用该路实际输出尺寸：
+        # - 原图 = 相机原始尺寸
+        # - 模型 = 模型输入尺寸 × scale（跨分辨率时与相机尺寸不同）
         if model == config.RAW_LABEL:
-            vw, vh = w, h
+            vw, vh = cam_w, cam_h
         else:
             _, scale = hub._get_engine(model)
-            vw, vh = w * scale, h * scale
+            input_w, input_h = resolve_input_size(model)
+            vw, vh = input_w * scale, input_h * scale
         fn = f"{ts}_{_safe_model_name(model)}.{fmt}"
         path = os.path.join(RECORDING_DIR, fn)
         writer = cv2.VideoWriter(path, fourcc, fps, (vw, vh), isColor=True)
