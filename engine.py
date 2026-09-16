@@ -4,10 +4,10 @@
   - first_dim = conv_first.0.weight.shape[0]
   - scale     = round(sqrt(conv_last.weight.shape[0]))
 
-支持 256/640 两个系列（按文件名关键字匹配，见 config.MODEL_INPUT_SIZES）：
-  - irsr256 系列：输入 256×192（兼容旧名 ir256/sr256）
-  - irsr640 系列：输入 640×512（兼容旧名 ir640/sr640）
-推理前会把相机帧缩放到各模型期望的输入尺寸。
+跨分辨率支持：
+  - 按文件名关键字识别模型期望的输入尺寸（见 config.MODEL_INPUT_SIZES）
+  - 推理前自动将相机帧缩放到模型期望的输入尺寸（降采样用 INTER_AREA，升采样用 INTER_LINEAR）
+  - 所有模型均可选择，无论相机分辨率如何
 
 多面板共享：同一模型同一帧序号只推理一次，结果缓存在 _results。
 """
@@ -45,25 +45,26 @@ def resolve_input_size(name: str) -> tuple[int, int]:
 
 
 def matched_output_size(models_dir: str, cam_size: tuple[int, int]) -> tuple[int, int]:
-    """给定相机尺寸，返回匹配模型的输出尺寸 (W,H)（取匹配集合中的最大）。
+    """给定相机尺寸，返回面板固定尺寸 (W,H)。
 
-    面板大小以此为基准固定，原图也最近邻缩放到该尺寸。
-    cam_size=(0,0) 或无可匹配模型时返回 (0,0)。
-    仅读 checkpoint 的 conv_last 通道数推导 scale，不构建完整模型。
+    跨分辨率支持：面板尺寸 = 相机尺寸 × 所有模型中的最大 scale。
+    这样原图（最近邻放大）和模型输出（平滑缩放到面板）可以在同一画布并排对比。
+    cam_size=(0,0) 或无模型时返回 (0,0)。
     """
     w, h = cam_size
     if not w:
         return (0, 0)
-    max_w, max_h = 0, 0
+    max_scale = 0
     for info in discover_models(models_dir):
-        if resolve_input_size(info["name"]) == (w, h):
-            try:
-                sd = _load_state(info["path"])
-                scale = int(round(sd["conv_last.weight"].shape[0] ** 0.5))
-                max_w, max_h = max(max_w, w * scale), max(max_h, h * scale)
-            except Exception:
-                continue
-    return max_w, max_h
+        try:
+            sd = _load_state(info["path"])
+            scale = int(round(sd["conv_last.weight"].shape[0] ** 0.5))
+            max_scale = max(max_scale, scale)
+        except Exception:
+            continue
+    if not max_scale:
+        return (0, 0)
+    return w * max_scale, h * max_scale
 
 
 def _load_state(model_path: str) -> dict:
