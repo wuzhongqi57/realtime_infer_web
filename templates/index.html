@@ -56,6 +56,7 @@
     border-radius: 6px; background: var(--panel); color: var(--text); cursor: pointer;
   }
   .tools button:hover { border-color: var(--accent); }
+  .tools button:disabled { opacity: 0.55; cursor: wait; }
   .tools button.rec { color: #fff; background: #c0392b; border-color: #c0392b; }
   .tools button.off { color: var(--warn); border-color: var(--warn); }
   .toast {
@@ -123,6 +124,7 @@
       </select>
     </label>
     <button id="btn-record" title="开始/停止录像">● 录像</button>
+    <button id="btn-ffc" title="合上挡板做一次快门校正（FFC）">快门校正</button>
     <button id="btn-cam-toggle" title="断开/重新连接摄像头">🔌 断开相机</button>
   </span>
 </header>
@@ -367,6 +369,26 @@
         }
       }
     } catch (e) { toast('录像操作失败: ' + e.message, false); }
+  });
+
+  $('btn-ffc').addEventListener('click', async () => {
+    const btn = $('btn-ffc');
+    if (btn.disabled) return;
+    btn.disabled = true;
+    try {
+      toast('正在快门校正…', true);
+      const r = await apiPost('/api/camera/ffc');
+      if (r.status === 'ok') {
+        toast('快门校正完成', true);
+        setFoot('快门校正完成', true);
+      } else {
+        toast('快门校正失败: ' + (r.message || '未知错误'), false);
+      }
+    } catch (e) {
+      toast('快门校正失败: ' + e.message, false);
+    } finally {
+      btn.disabled = false;
+    }
   });
 
   // 断开 / 重连相机

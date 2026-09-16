@@ -26,6 +26,7 @@ from flask_sock import Sock
 import config
 from capture import FrameSource, SharedState, list_cameras
 from engine import ModelHub, matched_output_size, resolve_input_size
+from shutter import ShutterError, ffc_update, sdk_available
 
 app = Flask(__name__)
 app.config["TEMPLATES_AUTO_RELOAD"] = True
@@ -357,6 +358,40 @@ def api_camera_status():
                     "size": list(state.cam_size), "paused": source._paused})
 
 
+@app.route("/api/camera/ffc", methods=["POST"])
+def api_camera_ffc():
+    """手动快门校正：合上挡板做一次 FFC。会短暂让出 OpenCV 设备。"""
+    if source is None:
+        return jsonify({"status": "error", "message": "视频源未启动"}), 400
+    if source.mode != "camera":
+        return jsonify({"status": "error", "message": "当前不是摄像头源，无法打快门"}), 400
+    if _recorders:
+        return jsonify({"status": "error", "message": "正在录像，请先停止再打快门"}), 400
+    ok, detail = sdk_available()
+    if not ok:
+        return jsonify({"status": "error", "message": detail}), 500
+
+    was_paused = source._paused
+    if not was_paused:
+        released = source.release_for_control(timeout=3.0)
+        if not released:
+            source.resume_after_control()
+            return jsonify({"status": "error", "message": "无法让出摄像头（OpenCV 仍占用）"}), 500
+        time.sleep(0.3)
+    try:
+        ffc_update()
+        return jsonify({"status": "ok"})
+    except ShutterError as exc:
+        config.log(f"快门校正失败: {exc}")
+        return jsonify({"status": "error", "message": str(exc)}), 500
+    except Exception as exc:
+        config.log(f"快门校正异常: {exc}")
+        return jsonify({"status": "error", "message": f"快门校正异常: {exc}"}), 500
+    finally:
+        if not was_paused:
+            source.resume_after_control()
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -384,7 +419,10 @@ def main():
                         help="视频源覆盖: image:<path> 或 video:<path>（调试用，默认摄像头）")
     parser.add_argument("--list-cameras", action="store_true", help="列出可用摄像头并退出")
     parser.add_argument("--list-models", action="store_true", help="列出模型目录中的可用模型并退出")
+    parser.add_argument("--sdk-dir", type=str, default=config.IRS_SDK_DIR,
+                        help="机芯 SDK 目录（含 libircmd.dll / libiruvc.dll）")
     args = parser.parse_args()
+    config.IRS_SDK_DIR = args.sdk_dir
 
     # 端口冲突检测：已有实例在跑时直接退出，避免双实例抢相机/端口
     if _port_in_use(args.port):

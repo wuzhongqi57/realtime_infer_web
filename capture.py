@@ -113,6 +113,7 @@ class FrameSource:
         self.cam_h = 0
         self._paused = False          # 手动断开（暂停采集）标志
         self._pause_lock = threading.Lock()
+        self._control_hold = threading.Event()  # 快门校正期间让出 VideoCapture
 
         if source:
             if source.startswith("image:"):
@@ -175,6 +176,13 @@ class FrameSource:
                     self.state.cam_size = (0, 0)
                 config.log("摄像头已手动断开")
                 time.sleep(0.2)
+                continue
+            if self._control_hold.is_set():
+                if self._cap is not None:
+                    self._cap.release()
+                    self._cap = None
+                    config.log("摄像头已让出（快门校正）")
+                time.sleep(0.05)
                 continue
             gray = None
             if self.mode == "camera":
@@ -246,3 +254,17 @@ class FrameSource:
             with self.state._lock:
                 self.state.cam_size = (self.cam_w, self.cam_h)
         config.log("camera resume requested")
+
+    def release_for_control(self, timeout: float = 3.0) -> bool:
+        """暂停 OpenCV 取流并释放设备，供机芯 USB 命令通道占用。不改 cam_size。"""
+        self._control_hold.set()
+        t0 = time.perf_counter()
+        while (time.perf_counter() - t0) < timeout:
+            if self._cap is None:
+                return True
+            time.sleep(0.05)
+        return self._cap is None
+
+    def resume_after_control(self) -> None:
+        """快门校正结束后恢复 OpenCV 采集。"""
+        self._control_hold.clear()
