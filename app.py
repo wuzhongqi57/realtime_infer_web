@@ -207,8 +207,8 @@ def _render(name: str, frame: np.ndarray, seq: int,
             for_stream: bool = True) -> tuple[bytes, float]:
     """按面板选择渲染一帧为 JPEG。伪彩设置来自该面板，不共用全局。
 
-    for_stream=True: 缩放到流尺寸 (STREAM_MAX_*)
-    for_stream=False: 保持面板原尺寸
+    for_stream=True: 先缩放灰度到流尺寸，再上色（快）
+    for_stream=False: 保持面板原尺寸，全分辨率上色
 
     Returns: (jpeg_bytes, inference_ms)
     """
@@ -217,13 +217,26 @@ def _render(name: str, frame: np.ndarray, seq: int,
     pal = view["effective"]
     infer_ms = 0.0
 
-    def _fit(bgr: np.ndarray, nearest: bool = False) -> np.ndarray:
-        if panel_h and (bgr.shape[0], bgr.shape[1]) != (panel_h, panel_w):
+    def _fit_gray(y: np.ndarray, nearest: bool = False) -> np.ndarray:
+        """Scale grayscale to panel size."""
+        if panel_h and (y.shape[0], y.shape[1]) != (panel_h, panel_w):
             interp = cv2.INTER_NEAREST if nearest else cv2.INTER_LINEAR
-            bgr = cv2.resize(bgr, (panel_w, panel_h), interpolation=interp)
-        return bgr
+            y = cv2.resize(y, (panel_w, panel_h), interpolation=interp)
+        return y
 
-    def _stream_scale(bgr: np.ndarray) -> np.ndarray:
+    def _stream_scale_gray(y: np.ndarray) -> np.ndarray:
+        """Scale grayscale to stream size."""
+        if not for_stream:
+            return y
+        h, w = y.shape[:2]
+        sw, sh = _compute_stream_size(w, h)
+        if (sw, sh) != (w, h):
+            interp = cv2.INTER_AREA if w > sw else cv2.INTER_LINEAR
+            y = cv2.resize(y, (sw, sh), interpolation=interp)
+        return y
+
+    def _stream_scale_bgr(bgr: np.ndarray) -> np.ndarray:
+        """Scale BGR to stream size (for UV mode which produces BGR directly)."""
         if not for_stream:
             return bgr
         h, w = bgr.shape[:2]
@@ -233,33 +246,49 @@ def _render(name: str, frame: np.ndarray, seq: int,
             bgr = cv2.resize(bgr, (sw, sh), interpolation=interp)
         return bgr
 
-    if name == config.RAW_LABEL or (view["mode"] == "uv" and not _is_heavy(name)):
-        if view["mode"] == "uv":
-            y_fc, u, v = false_color.lut_to_yuv(frame, pal)
-            if name == config.RAW_LABEL:
-                y_hr = y_fc
-            else:
-                y_hr, infer_ms = hub.infer(name, y_fc, seq, cache_tag="uv:" + pal)
-            bgr, _ = false_color.attach_uv(y_hr, u, v)
+    # UV mode: uses lut_to_yuv which transforms Y already, need BGR scaling
+    if view["mode"] == "uv" and not _is_heavy(name):
+        y_fc, u, v = false_color.lut_to_yuv(frame, pal)
+        if name == config.RAW_LABEL:
+            y_hr = y_fc
         else:
-            bgr = false_color.apply_to_bgr(frame, pal)
-        bgr = _fit(bgr, nearest=(name == config.RAW_LABEL))
-        return _jpeg(_stream_scale(bgr)), infer_ms
+            y_hr, infer_ms = hub.infer(name, y_fc, seq, cache_tag="uv:" + pal)
+        bgr, _ = false_color.attach_uv(y_hr, u, v)
+        return _jpeg(_stream_scale_bgr(bgr)), infer_ms
+
+    # Raw or regular models: scale grayscale first, then apply palette (fast!)
+    if name == config.RAW_LABEL:
+        y_out = _fit_gray(frame, nearest=True)
+        y_out = _stream_scale_gray(y_out)
+        bgr = false_color.apply_to_bgr(y_out, pal)
+        return _jpeg(bgr), 0.0
+
     if _is_heavy(name):
         if hat_hold is not None:
             if hat_hold.get("jpeg") is None:
                 ph = hat_backend.make_placeholder(frame, (panel_w, panel_h))
                 if ph.ndim == 2:
+                    ph = _stream_scale_gray(ph)
                     ph = false_color.apply_to_bgr(ph, pal)
-                hat_hold["jpeg"] = _jpeg(_stream_scale(ph))
+                hat_hold["jpeg"] = _jpeg(ph)
             return hat_hold["jpeg"] or b"", 0.0
         ph = hat_backend.make_placeholder(frame, (panel_w, panel_h))
         if ph.ndim == 2:
+            ph = _stream_scale_gray(ph)
             ph = false_color.apply_to_bgr(ph, pal)
-        return _jpeg(_stream_scale(ph)), 0.0
+        return _jpeg(ph), 0.0
+
+    # Regular model: infer, scale grayscale to stream size, then colorize
     sr, infer_ms = hub.infer(name, frame, seq)
+    sr_h, sr_w = sr.shape[:2]
+    # Fit to panel if needed (for cross-resolution models)
+    if panel_h and (sr_h, sr_w) != (panel_h, panel_w):
+        interp = cv2.INTER_AREA if sr_h > panel_h else cv2.INTER_LINEAR
+        sr = cv2.resize(sr, (panel_w, panel_h), interpolation=interp)
+    # Scale grayscale to stream size FIRST, then apply palette (fast!)
+    sr = _stream_scale_gray(sr)
     bgr = false_color.apply_to_bgr(sr, pal)
-    return _jpeg(_stream_scale(_fit(bgr))), infer_ms
+    return _jpeg(bgr), infer_ms
 
 
 # ---------------------------------------------------------------------------

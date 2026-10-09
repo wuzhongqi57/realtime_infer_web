@@ -82,6 +82,48 @@ def benchmark_jpeg(frame: np.ndarray, quality: int = 80, iterations: int = 100) 
     return np.median(times), np.mean(sizes) if sizes else 0
 
 
+def benchmark_palette_ordering(full_size: tuple, stream_size: tuple,
+                               colormap: str = "ironbow", iterations: int = 50) -> dict:
+    """Compare palette-at-full-res vs palette-after-downscale.
+
+    Returns dict with timing for both approaches and the speedup factor.
+    """
+    import false_color
+    false_color.ensure_luts()
+
+    full_w, full_h = full_size
+    stream_w, stream_h = stream_size
+
+    frame_full = generate_synthetic_frame(full_w, full_h)
+
+    times_full_first = []
+    for _ in range(iterations):
+        t0 = time.perf_counter()
+        bgr_full = false_color.apply_to_bgr(frame_full, colormap)
+        bgr_stream = cv2.resize(bgr_full, (stream_w, stream_h), interpolation=cv2.INTER_AREA)
+        times_full_first.append((time.perf_counter() - t0) * 1000)
+
+    times_downscale_first = []
+    for _ in range(iterations):
+        t0 = time.perf_counter()
+        gray_stream = cv2.resize(frame_full, (stream_w, stream_h), interpolation=cv2.INTER_AREA)
+        bgr_stream = false_color.apply_to_bgr(gray_stream, colormap)
+        times_downscale_first.append((time.perf_counter() - t0) * 1000)
+
+    palette_full_ms = np.median(times_full_first)
+    palette_after_ms = np.median(times_downscale_first)
+    speedup = palette_full_ms / palette_after_ms if palette_after_ms > 0 else 0
+
+    return {
+        "full_size": f"{full_w}x{full_h}",
+        "stream_size": f"{stream_w}x{stream_h}",
+        "colormap": colormap,
+        "palette_at_full_ms": palette_full_ms,
+        "palette_after_downscale_ms": palette_after_ms,
+        "speedup": speedup,
+    }
+
+
 def benchmark_inference(model_name: str, model_path: str, frame: np.ndarray,
                         device: str, use_fp16: bool, iterations: int = 20) -> dict:
     """Benchmark model inference, return timing dict."""
@@ -258,6 +300,27 @@ def main():
 
     if not args.quiet:
         print()
+        print("=== Palette Ordering Benchmarks ===")
+        print("  Comparing: colorize-then-downscale vs downscale-then-colorize")
+        print()
+
+    palette_tests = [
+        ((2560, 2048), (1280, 1024), "ironbow"),
+        ((2560, 2048), (1280, 1024), "rainbow"),
+        ((2560, 2048), (960, 768), "ironbow"),
+        ((1280, 1024), (640, 512), "ironbow"),
+    ]
+
+    for full_size, stream_size, cmap in palette_tests:
+        result = benchmark_palette_ordering(full_size, stream_size, cmap, args.iterations)
+        if not args.quiet:
+            print(f"  {result['full_size']} → {result['stream_size']} ({cmap}):")
+            print(f"    Palette at full res:     {result['palette_at_full_ms']:6.2f} ms")
+            print(f"    Palette after downscale: {result['palette_after_downscale_ms']:6.2f} ms")
+            print(f"    Speedup: {result['speedup']:.1f}x faster")
+            print()
+
+    if not args.quiet:
         print("=== JPEG Encode Benchmarks ===")
 
     jpeg_tests = [
@@ -329,8 +392,12 @@ def main():
     for cm, ms in colormap_results.items():
         print(f"  {cm}: {ms:.2f} ms")
     print()
-    print("Key insight: Use stream downscaling to reduce encode/transfer cost.")
-    print("Full panel JPEG can be 5-10x slower than stream-sized JPEG.")
+    print("Key optimizations:")
+    print("  1. Downscale grayscale FIRST, then apply palette (cv2.LUT)")
+    print("     - Colorizing after downscale can be 3-5x faster for x4 models")
+    print("     - cv2.LUT is constant-time regardless of image complexity")
+    print("  2. Use stream downscaling to reduce encode/transfer cost")
+    print("     - Full panel JPEG can be 5-10x slower than stream-sized JPEG")
 
     return 0
 
