@@ -48,7 +48,7 @@ def matched_output_size(models_dir: str, cam_size: tuple[int, int]) -> tuple[int
     """给定相机尺寸，返回面板固定尺寸 (W,H)。
 
     跨分辨率支持：面板尺寸 = 相机尺寸 × 所有模型中的最大 scale。
-    这样原图（最近邻放大）和模型输出（平滑缩放到面板）可以在同一画布并排对比。
+    这样原图和模型输出都双线性缩放到同一面板尺寸，可以在同一画布并排对比。
     cam_size=(0,0) 或无模型时返回 (0,0)。
     """
     w, h = cam_size
@@ -62,6 +62,12 @@ def matched_output_size(models_dir: str, cam_size: tuple[int, int]) -> tuple[int
             max_scale = max(max_scale, scale)
         except Exception:
             continue
+    try:
+        import hat_backend
+        if hat_backend.available()[0]:
+            max_scale = max(max_scale, hat_backend.scale())
+    except Exception:
+        pass
     if not max_scale:
         return (0, 0)
     return w * max_scale, h * max_scale
@@ -164,11 +170,16 @@ class ModelHub:
                            f"输入 {input_w}x{input_h}, {n/1e6:.3f}M, {self.device})")
             return self._engines[name]
 
-    def infer(self, name: str, frame: np.ndarray, seq: int) -> tuple[np.ndarray, float]:
-        """推理一帧。自动把帧缩放到模型期望输入尺寸。返回 (sr_uint8, ms)。"""
+    def infer(self, name: str, frame: np.ndarray, seq: int,
+              cache_tag: str = "") -> tuple[np.ndarray, float]:
+        """推理一帧。自动把帧缩放到模型期望输入尺寸。返回 (sr_uint8, ms)。
+
+        cache_tag 区分同一帧上的不同输入（原始 Y 与伪彩 Y' 不能共用缓存）。
+        """
+        key = (seq, cache_tag)
         with self._lock:
             hit = self._results.get(name)
-            if hit is not None and hit[0] == seq:
+            if hit is not None and hit[0] == key:
                 return hit[1], hit[2]
 
         model, scale = self._get_engine(name)
@@ -187,5 +198,5 @@ class ModelHub:
         sr = out.squeeze().clamp(0.0, 1.0).mul(255.0).byte().cpu().numpy()
 
         with self._lock:
-            self._results[name] = (seq, sr, ms)
+            self._results[name] = (key, sr, ms)
         return sr, ms

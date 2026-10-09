@@ -33,6 +33,13 @@
   .badge.ok { color: var(--accent); border-color: var(--accent); }
   .badge.warn { color: var(--warn); border-color: var(--warn); }
   .badge.bad { color: var(--bad); border-color: var(--bad); }
+  #btn-match-filter {
+    padding: 3px 8px; font-size: 12px; font-family: inherit;
+    border: 1px solid var(--border); border-radius: 6px;
+    background: var(--panel); color: var(--dim); cursor: pointer;
+  }
+  #btn-match-filter.on { color: var(--accent); border-color: var(--accent); }
+  #btn-match-filter:hover { border-color: var(--accent); }
   .count-ctl {
     display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--dim);
     margin-left: auto;
@@ -59,6 +66,7 @@
   .tools button:disabled { opacity: 0.55; cursor: wait; }
   .tools button.rec { color: #fff; background: #c0392b; border-color: #c0392b; }
   .tools button.off { color: var(--warn); border-color: var(--warn); }
+  .tools button.on { color: var(--accent); border-color: var(--accent); }
   .toast {
     position: fixed; top: 54px; right: 14px; z-index: 999;
     max-width: 380px; padding: 9px 14px; font-size: 0.78rem; line-height: 1.5;
@@ -69,6 +77,28 @@
   }
   .toast.ok { opacity: 1; transform: translateY(0); border-left-color: var(--accent); }
   .toast.err { opacity: 1; transform: translateY(0); border-left-color: #e74c3c; }
+  .hat-progress-mask {
+    position: fixed; inset: 0; z-index: 2000;
+    background: rgba(0,0,0,0.55);
+    display: none; align-items: center; justify-content: center;
+  }
+  .hat-progress-mask.show { display: flex; }
+  .hat-progress-box {
+    width: min(420px, 92vw); padding: 22px 24px 20px;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    box-shadow: 0 8px 28px rgba(0,0,0,0.45); color: var(--text);
+  }
+  .hat-progress-box h3 { margin: 0 0 8px; font-size: 15px; font-weight: 600; }
+  .hat-progress-box .msg { font-size: 12px; color: var(--dim); margin-bottom: 14px; min-height: 1.4em; }
+  .hat-bar {
+    height: 10px; border-radius: 5px; background: #2a2a2a; overflow: hidden;
+  }
+  .hat-bar > i {
+    display: block; height: 100%; width: 0%;
+    background: linear-gradient(90deg, #3d9e6f, #5ecf95);
+    transition: width .25s ease;
+  }
+  .hat-pct { margin-top: 10px; font-size: 13px; text-align: right; color: var(--dim); }
   #main { flex: 1; display: flex; gap: 12px; padding: 12px; min-height: 0; }
   .panel {
     flex: 1; min-width: 0;
@@ -81,15 +111,28 @@
     border-bottom: 1px solid var(--border);
     display: flex; justify-content: space-between; align-items: center; gap: 8px;
   }
-  .panel .title select {
+  .panel .title select,
+  .panel .fc-row select {
     background: var(--bg); color: var(--text);
     border: 1px solid var(--border); border-radius: 4px;
     padding: 3px 6px; font-size: 12px; font-family: inherit;
-    max-width: 60%;
   }
+  .panel .title select { max-width: 58%; }
+  .panel .fc-row {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
+    padding: 6px 12px; font-size: 12px; color: var(--dim);
+    border-bottom: 1px solid var(--border);
+  }
+  .panel .fc-row label { display: flex; align-items: center; gap: 4px; }
   .panel .stage {
     flex: 1; display: flex; align-items: center; justify-content: center;
-    min-height: 0; padding: 8px;
+    min-height: 0; padding: 8px; position: relative;
+  }
+  .heavy-badge {
+    position: absolute; left: 12px; top: 12px; z-index: 2;
+    font-size: 11px; padding: 3px 8px; border-radius: 4px;
+    background: rgba(240, 160, 48, 0.92); color: #1a1a1a;
+    pointer-events: none; display: none;
   }
   canvas { max-width: 100%; max-height: 100%; background: #000; }
   footer {
@@ -109,6 +152,14 @@
   <h1>IR 实时推理模拟</h1>
   <span class="badge warn" id="b-cam" data-label="摄像头">摄像头: 连接中</span>
   <span class="badge" id="b-model" data-label="模型">模型: 待加载</span>
+  <button id="btn-match-filter" class="on" title="按相机分辨率筛选下拉模型（默认开）。点击可关闭，显示全部模型">分辨率筛选</button>
+  <label class="count-ctl">面板数
+    <select id="panel-count" title="同时对比的面板数量（1～3）">
+      <option value="1">1</option>
+      <option value="2" selected>2</option>
+      <option value="3">3</option>
+    </select>
+  </label>
   <span class="tools">
     <label class="fmt-ctl">📷
       <select id="snap-fmt">
@@ -120,11 +171,11 @@
     <label class="fmt-ctl">●
       <select id="rec-fmt">
         <option value="avi" selected>AVI</option>
-        <option value="mp4">MP4</option>
+        <option value="mp4" title="使用 MPEG-4(mp4v)，不依赖 OpenH264">MP4</option>
       </select>
     </label>
     <button id="btn-record" title="开始/停止录像">● 录像</button>
-    <button id="btn-ffc" title="合上挡板做一次快门校正（FFC）">快门校正</button>
+    <button id="btn-ffc" title="合上挡板做一次快门校正（FFC）" style="display:none">快门校正</button>
     <button id="btn-cam-toggle" title="断开/重新连接摄像头">🔌 断开相机</button>
   </span>
 </header>
@@ -141,27 +192,40 @@
   const mainEl = $('main');
 
   // ---- 面板流（每条 WebSocket 对应一个面板）----
-  function createPanel(select, canvas, ctx) {
+  function createPanel(select, canvas, ctx, fcEls) {
     let ws = null, current = null, closed = false;
 
-    // 缩放算法按显示内容决定：原图→最近邻，模型→双线性
+    function getFalseColor() {
+      return {
+        enabled: !!fcEls.en.checked,
+        palette: fcEls.pal.value,
+        mode: fcEls.mode.value,
+      };
+    }
+    function sendState() {
+      if (ws && ws.readyState === WebSocket.OPEN && current) {
+        ws.send(JSON.stringify({ model: current, false_color: getFalseColor() }));
+      }
+    }
+
     function applyDisplayMode() {
-      const isRaw = (current === '原图');
-      ctx.imageSmoothingEnabled = !isRaw;
-      canvas.style.imageRendering = isRaw ? 'pixelated' : 'auto';
+      const raw = current === '原图';
+      ctx.imageSmoothingEnabled = !raw;
+      if ('imageSmoothingQuality' in ctx) ctx.imageSmoothingQuality = 'high';
+      canvas.style.imageRendering = raw ? 'pixelated' : 'auto';
     }
 
     function open() {
       if (closed) return;
       ws = new WebSocket(`ws://${location.host}/ws/panel`);
       ws.binaryType = 'arraybuffer';
-      ws.onopen = () => { if (current) ws.send(JSON.stringify({ model: current })); };
+      ws.onopen = () => sendState();
       ws.onmessage = e => {
         if (typeof e.data === 'string') return;
         const blob = new Blob([e.data], { type: 'image/jpeg' });
         createImageBitmap(blob).then(bmp => {
           applyDisplayMode();
-          ctx.drawImage(bmp, 0, 0, canvas.width, canvas.height);   // 统一缩放到固定面板尺寸
+          ctx.drawImage(bmp, 0, 0, canvas.width, canvas.height);
           bmp.close();
         }).catch(() => {});
       };
@@ -172,29 +236,56 @@
     select.addEventListener('change', () => {
       current = select.value;
       applyDisplayMode();
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ model: current }));
-      }
+      sendState();
     });
+    const onFc = () => sendState();
+    fcEls.en.addEventListener('change', onFc);
+    fcEls.pal.addEventListener('change', onFc);
+    fcEls.mode.addEventListener('change', onFc);
 
     open();
     return {
-      setModel: m => { current = m; select.value = m; applyDisplayMode(); },
+      setModel: m => { current = m; select.value = m; applyDisplayMode(); sendState(); },
       getModel: () => current,
+      getFalseColor,
       close: () => { closed = true; if (ws) ws.close(); }
     };
   }
 
   // ---- 全局状态 ----
-  let currentOptions = [];        // 当前可选模型名（不含"原图"）
+  let currentOptions = [];        // 当前下拉里的模型名（不含"原图"）
+  let allModelOptions = [];       // 全部模型（关闭筛选时用）
+  let matchedModelOptions = [];   // 与相机分辨率匹配的模型
+  let filterByCamera = true;      // 默认按分辨率筛选
+  let heavyModels = new Set();    // 仅拍照/录像的重模型
   let lastCamKey = null;
+  let lastCamSize = null;         // [W,H]
   let lastPanelSize = null;       // 固定面板尺寸 [W,H]
   let panels = [];                // { el, select, canvas, ctx, api }
+
+  function isHeavy(name) {
+    return heavyModels.has(name);
+  }
+
+  function updateHeavyBadge(panel) {
+    let badge = panel.el.querySelector('.heavy-badge');
+    if (!badge) {
+      badge = document.createElement('div');
+      badge.className = 'heavy-badge';
+      panel.el.querySelector('.stage').appendChild(badge);
+    }
+    const heavy = isHeavy(panel.api.getModel());
+    badge.style.display = heavy ? '' : 'none';
+    badge.textContent = heavy ? '仅拍照 · 录像后超分' : '';
+  }
 
   // ---- 面板增删（1~3 个）----
   function fillSelect(select) {
     const options = ['原图'].concat(currentOptions);
-    select.innerHTML = options.map(m => `<option value="${m}">${m}</option>`).join('');
+    select.innerHTML = options.map(m => {
+      const tag = (m !== '原图' && isHeavy(m)) ? '（仅拍照/录像后）' : '';
+      return `<option value="${m}">${m}${tag}</option>`;
+    }).join('');
   }
   function applyPanelSize(canvas) {
     if (lastPanelSize && lastPanelSize[0]) {
@@ -207,18 +298,45 @@
     const el = document.createElement('div');
     el.className = 'panel';
     el.innerHTML =
-      `<div class="title"><span>面板 ${n}</span><select></select></div>` +
+      `<div class="title"><span>面板 ${n}</span><select class="model-select"></select></div>` +
+      `<div class="fc-row">` +
+        `<label title="本面板是否上伪彩"><input type="checkbox" class="fc-en"> 伪彩</label>` +
+        `<select class="fc-pal" title="调色板">` +
+          `<option value="ironbow">铁虹</option>` +
+          `<option value="lava">熔岩</option>` +
+          `<option value="rainbow">彩虹</option>` +
+          `<option value="white_hot">白热</option>` +
+          `<option value="black_hot">黑热</option>` +
+        `</select>` +
+        `<select class="fc-mode" title="仅LUT映射：对当前画面亮度直接查表。UV插值：先 LUT 得到 Y'UV'，Y' 走超分，只有 UV 双线性放大">` +
+          `<option value="lut">仅LUT映射</option>` +
+          `<option value="uv">UV插值</option>` +
+        `</select>` +
+      `</div>` +
       `<div class="stage"><canvas width="1024" height="768"></canvas></div>`;
     mainEl.appendChild(el);
-    const select = el.querySelector('select');
+    const select = el.querySelector('.model-select');
     const canvas = el.querySelector('canvas');
     const ctx = canvas.getContext('2d');
-    const api = createPanel(select, canvas, ctx);
+    const fcEls = {
+      en: el.querySelector('.fc-en'),
+      pal: el.querySelector('.fc-pal'),
+      mode: el.querySelector('.fc-mode'),
+    };
+    if (n === 2) fcEls.mode.value = 'uv';
+    const api = createPanel(select, canvas, ctx, fcEls);
     fillSelect(select);
     applyPanelSize(canvas);
-    // 默认：面板1=原图，其余=第一个匹配模型
-    api.setModel(n === 1 ? '原图' : (currentOptions.length ? currentOptions[0] : '原图'));
-    panels.push({ el, select, canvas, ctx, api });
+    // 默认：面板1=原图；面板2起依次选不同模型（不够则复用最后一个）
+    let defaultModel = '原图';
+    if (n > 1 && currentOptions.length) {
+      defaultModel = currentOptions[Math.min(n - 2, currentOptions.length - 1)];
+    }
+    api.setModel(defaultModel);
+    const panel = { el, select, canvas, ctx, api };
+    select.addEventListener('change', () => updateHeavyBadge(panel));
+    panels.push(panel);
+    updateHeavyBadge(panel);
   }
   function removePanel() {
     const p = panels.pop();
@@ -232,48 +350,93 @@
   }
 
   // ---- 模型列表刷新（相机分辨率变化时重新匹配）----
-  async function refreshModels() {
-    let models = [], camSize = null, panelSize = null;
-    try {
-      const r = await fetch('/api/models');
-      const data = await r.json();
-      models = data.models || [];
-      camSize = data.camera_size;
-      panelSize = data.panel_size;
-    } catch (_) { return camSize; }
-    currentOptions = models;
-    if (panelSize && panelSize[0]) lastPanelSize = panelSize;
-
-    // 固定面板尺寸 + 重建所有下拉表（保留仍有效的选择）
-    const options = ['原图'].concat(models);
+  function applyModelFilter() {
+    currentOptions = filterByCamera ? matchedModelOptions : allModelOptions;
+    const options = ['原图'].concat(currentOptions);
     for (const p of panels) {
       applyPanelSize(p.canvas);
       const prev = p.select.value;
-      p.select.innerHTML = options.map(m => `<option value="${m}">${m}</option>`).join('');
-      if (prev === '原图' || models.includes(prev)) p.select.value = prev;
+      p.select.innerHTML = options.map(m => {
+        const tag = isHeavy(m) ? '（仅拍照/录像后）' : '';
+        return `<option value="${m}">${m}${tag}</option>`;
+      }).join('');
+      if (prev === '原图' || currentOptions.includes(prev)) p.select.value = prev;
+      updateHeavyBadge(p);
     }
-    // 面板当前选择失效时回退到原图
     for (const p of panels) {
-      if (p.api.getModel() !== '原图' && !models.includes(p.api.getModel())) {
+      if (p.api.getModel() !== '原图' && !currentOptions.includes(p.api.getModel())) {
         p.api.setModel('原图');
+        updateHeavyBadge(p);
       }
     }
+    const btn = $('btn-match-filter');
+    if (btn) {
+      btn.classList.toggle('on', filterByCamera);
+      btn.textContent = filterByCamera ? '分辨率筛选' : '显示全部';
+      btn.title = filterByCamera
+        ? '已按相机分辨率筛选下拉模型。点击关闭筛选，显示全部模型'
+        : '已显示全部模型。点击按相机分辨率筛选';
+    }
+  }
+
+  async function refreshModels() {
+    let models = [], allModels = [], matched = [], camSize = null, panelSize = null, heavy = [];
+    try {
+      const r = await fetch('/api/models');
+      const data = await r.json();
+      allModels = data.all_models || data.models || [];
+      matched = data.matched_models || data.models || [];
+      models = filterByCamera ? matched : allModels;
+      heavy = data.heavy_models || [];
+      camSize = data.camera_size;
+      panelSize = data.panel_size;
+    } catch (_) { return camSize; }
+    allModelOptions = allModels;
+    matchedModelOptions = matched;
+    heavyModels = new Set(heavy);
+    if (panelSize && panelSize[0]) lastPanelSize = panelSize;
+
+    lastCamSize = camSize;
+    applyModelFilter();
 
     if (camSize && camSize[0]) {
       $('b-cam').className = 'badge ok';
       $('b-cam').textContent = '摄像头: ' + camSize[0] + '×' + camSize[1];
     }
-    const sizeTxt = camSize && camSize[0] ? camSize[0] + '×' + camSize[1] : '?';
-    $('b-model').className = 'badge ' + (models.length ? 'ok' : 'bad');
-    $('b-model').textContent = '模型: ' + (models.length
-      ? models.length + ' 个（匹配 ' + sizeTxt + '）' : '无');
+    updateModelBadge();
     return camSize;
+  }
+
+  function updateModelBadge() {
+    const camSize = lastCamSize;
+    const sizeTxt = camSize && camSize[0] ? camSize[0] + '×' + camSize[1] : '?';
+    const shown = currentOptions.length;
+    const total = allModelOptions.length;
+    $('b-model').className = 'badge ' + (shown ? 'ok' : 'bad');
+    $('b-model').textContent = filterByCamera
+      ? ('模型: ' + shown + ' 个（匹配 ' + sizeTxt + (total > shown ? ' / 共 ' + total : '') + '）')
+      : ('模型: 全部 ' + total + ' 个');
+  }
+
+  function applyFfcButton(enabled) {
+    $('btn-ffc').style.display = enabled ? '' : 'none';
+  }
+
+  async function refreshFfcButton() {
+    try {
+      const r = await (await fetch('/api/camera/status', { cache: 'no-store' })).json();
+      applyFfcButton(!!r.ffc);
+    } catch (_) {
+      applyFfcButton(false);
+    }
   }
 
   async function init() {
     const camSize = await refreshModels();       // 服务端会等相机确定分辨率（最多 5s）
     lastCamKey = camSize && camSize[0] ? camSize.join('x') : '?';
-    setPanelCount(2);                            // 默认 2 面板
+    const n = parseInt($('panel-count').value, 10) || 2;
+    setPanelCount(n);
+    await refreshFfcButton();
   }
 
   // ---- 摄像头状态轮询（含分辨率变化 → 重新匹配模型）----
@@ -281,6 +444,7 @@
   async function poll() {
     try {
       const s = await (await fetch('/api/status', { cache: 'no-store' })).json();
+      if (s.ffc !== undefined) applyFfcButton(!!s.ffc);
       const seq = s.raw_seq || 0;
       if (lastSeq === null) lastSeq = seq;
       if (seq > lastSeq) { lastSeq = seq; noFramePolls = 0; }
@@ -303,7 +467,16 @@
     } catch (_) {}
   }
 
-  // 面板固定为 2（原图 + 模型对比）；panel-count 下拉已废弃移除
+  // 面板数量 1～3
+  $('panel-count').addEventListener('change', () => {
+    const n = parseInt($('panel-count').value, 10) || 2;
+    setPanelCount(n);
+  });
+  $('btn-match-filter').addEventListener('click', () => {
+    filterByCamera = !filterByCamera;
+    applyModelFilter();
+    updateModelBadge();
+  });
 
   // ---- 工具栏：拍照 / 录像 / 断开相机 ----
   // toast 提示（右上角，3.5s 自动消失）
@@ -328,13 +501,18 @@
     $('cam-detail').innerHTML = `<span class="dot ${ok ? 'ok' : 'warn'}"></span>${msg}`;
   }
 
-  // 拍照：保存所有面板的画面（去重，含算法结果），格式可选 PNG/JPG
+  // 拍照：按每个面板自己的模型 + 伪彩设置各存一张
   $('btn-snap').addEventListener('click', async () => {
     try {
-      const models = [...new Set(panels.map(p => p.api.getModel()))];
-      if (!models.length) { toast('无面板', false); return; }
+      if (!panels.length) { toast('无面板', false); return; }
       const fmt = $('snap-fmt').value;
-      const rs = await Promise.all(models.map(m => apiPost('/api/snapshot', { model: m, format: fmt })));
+      const hasHeavy = panels.some(p => isHeavy(p.api.getModel()));
+      if (hasHeavy) toast('含 HAT：推理较慢，请稍候…', true);
+      const rs = await Promise.all(panels.map(p => apiPost('/api/snapshot', {
+        model: p.api.getModel(),
+        format: fmt,
+        false_color: p.api.getFalseColor(),
+      })));
       const files = rs.filter(r => r.status === 'ok');
       if (files.length) {
         const names = files.map(f => f.model).join(', ');
@@ -346,23 +524,115 @@
     } catch (e) { toast('拍照失败: ' + e.message, false); }
   });
 
-  // 录像：同时录制所有面板的视频（每面板一路），格式可选 AVI/MP4
+  // HAT 离线超分进度条
+  const hatMask = document.createElement('div');
+  hatMask.className = 'hat-progress-mask';
+  hatMask.innerHTML = `
+    <div class="hat-progress-box">
+      <h3>HAT×4 离线超分</h3>
+      <div class="msg" id="hat-prog-msg">准备中…</div>
+      <div class="hat-bar"><i id="hat-prog-bar"></i></div>
+      <div class="hat-pct" id="hat-prog-pct">0%</div>
+    </div>`;
+  document.body.appendChild(hatMask);
+  function showHatProgress(show) {
+    hatMask.classList.toggle('show', !!show);
+  }
+  function setHatProgress(pct, msg) {
+    const p = Math.max(0, Math.min(100, pct | 0));
+    $('hat-prog-bar').style.width = p + '%';
+    $('hat-prog-pct').textContent = p + '%';
+    if (msg) $('hat-prog-msg').textContent = msg;
+  }
+  async function waitHatJob(jobId) {
+    showHatProgress(true);
+    setHatProgress(0, '已开始离线 HAT 超分…');
+    const t0 = Date.now();
+    while (true) {
+      let q;
+      try {
+        const resp = await fetch('/api/recording/hat_progress?job_id=' + encodeURIComponent(jobId));
+        q = await resp.json();
+      } catch (e) {
+        showHatProgress(false);
+        toast('HAT 进度查询失败: ' + e.message, false);
+        return null;
+      }
+      if (q.status !== 'ok') {
+        showHatProgress(false);
+        toast('HAT 任务异常: ' + (q.message || '未知'), false);
+        return null;
+      }
+      const pct = q.progress || 0;
+      const detail = (q.total > 0)
+        ? `${q.message || ''}（${q.current}/${q.total}）`
+        : (q.message || '');
+      setHatProgress(pct, detail);
+      if (q.job_status === 'done') {
+        setHatProgress(100, q.message || '完成');
+        await new Promise(r => setTimeout(r, 400));
+        showHatProgress(false);
+        toast(`HAT 超分完成 → ${q.file}`, true);
+        setFoot(`HAT 超分完成 → ${q.file}`, true);
+        return q;
+      }
+      if (q.job_status === 'error') {
+        showHatProgress(false);
+        toast('HAT 超分失败: ' + (q.error || q.message || '未知'), false);
+        return null;
+      }
+      if (Date.now() - t0 > 2 * 60 * 60 * 1000) {
+        showHatProgress(false);
+        toast('HAT 超分超时（>2h），请检查服务器日志', false);
+        return null;
+      }
+      await new Promise(r => setTimeout(r, 800));
+    }
+  }
+
+  // 录像：轻量模型实时同帧写入；HAT 录制中不推理，停止后离线超分
   $('btn-record').addEventListener('click', async () => {
     const btn = $('btn-record');
     try {
       if (btn.dataset.rec === '1') {
         const r = await apiPost('/api/recording/stop');
         btn.dataset.rec = '0'; btn.textContent = '● 录像'; btn.classList.remove('rec');
+        $('panel-count').disabled = false;
         const cnt = (r.files && r.files.length) || 0;
-        toast(`录像已保存 ${cnt} 路 (${r.files ? r.files[0].frames : 0} 帧/路)`, true);
-        setFoot(`录像已保存 ${cnt} 路`, true);
+        const frames = (r.synced_frames != null)
+          ? r.synced_frames
+          : (r.files && r.files[0] ? r.files[0].frames : 0);
+        const counts = (r.files || []).map(f => f.frames);
+        const same = counts.length > 0 && counts.every(c => c === counts[0]);
+        const detail = same
+          ? `（已同步）`
+          : `（不一致: ${counts.join('/') }）`;
+        toast(`录像已保存 ${cnt} 路 × ${frames} 帧${detail}`, same);
+        setFoot(`录像已保存 ${cnt} 路 × ${frames} 帧`, same);
+        const ph = r.post_hat;
+        if (ph && ph.job_id) {
+          await waitHatJob(ph.job_id);
+        } else if (ph && ph.status === 'error') {
+          toast('HAT 未启动: ' + (ph.message || ''), false);
+        }
       } else {
-        const models = [...new Set(panels.map(p => p.api.getModel()))];
+        const jobs = panels.map(p => ({
+          model: p.api.getModel(),
+          false_color: p.api.getFalseColor(),
+        }));
         const fmt = $('rec-fmt').value;
-        const r = await apiPost('/api/recording/start', { models: models, format: fmt });
+        const wantHat = jobs.some(j => isHeavy(j.model));
+        if (wantHat) {
+          toast('含 HAT：录制中不超分，停止后离线处理', true);
+        }
+        const r = await apiPost('/api/recording/start', { panels: jobs, format: fmt });
         if (r.status === 'ok') {
           btn.dataset.rec = '1'; btn.textContent = '■ 停止录像'; btn.classList.add('rec');
-          toast(`录像中 ${r.models.length} 路 (${fmt.toUpperCase()}) → ${r.files[0]}`, true);
+          $('panel-count').disabled = true;
+          const enc = (r.format || fmt).toUpperCase() + (r.fourcc ? '/' + r.fourcc : '');
+          const heavyTip = r.hat_deferred ? ' · HAT改停后' : '';
+          const autoTip = r.raw_auto ? '（已自动录原图供HAT）' : '';
+          toast(`录像中 ${r.models.length} 路 (${enc}${heavyTip})${autoTip} → ${r.files[0]}`, true);
           setFoot(`录像中 ${r.models.length} 路...`, true);
         } else {
           toast('录像启动失败: ' + r.message, false);

@@ -1,6 +1,6 @@
 """视频源采集 — 摄像头 / 图像文件 / 视频文件，单生产者线程。
 
-把最新一帧灰度图 (H,W) 写入 SharedState，帧序号单调递增。
+把最新一帧灰度 Y (H,W) 与 UV (H,W,2) 写入 SharedState，帧序号单调递增。
 摄像头分辨率自适应：启动时按设备实际输出读取（256×192 或 640×512 均可）。
 
 部分红外 UVC 相机实测取流要求：
@@ -8,7 +8,7 @@
 - 必须设 CAP_PROP_CONVERT_RGB=0 才能取到帧（默认 8-bit 协商返回
   MF_E_NO_VIDEO_SAMPLE_AVAILABLE，无帧）
 - 帧格式为 YUY2：256×192 → 98304 字节，640×512 → 655360 字节；
-  亮度 Y 在每 2 字节首位
+  字节序 Y0 U0 Y1 V0 | …；亮度 Y 在偶数字节
 - 上电后约 1 秒（前若干帧）为空帧，需过滤
 """
 
@@ -19,6 +19,7 @@ import cv2
 import numpy as np
 
 import config
+import yuv_codec
 
 
 class SharedState:
@@ -27,7 +28,8 @@ class SharedState:
     def __init__(self):
         self.running = True
         self._lock = threading.Lock()
-        self.raw_frame = None      # 最新原图灰度 uint8 (H,W)，分辨率随相机
+        self.raw_frame = None      # 最新原图 Y 灰度 uint8 (H,W)
+        self.raw_uv = None         # 最新 UV uint8 (H,W,2)；调试源为 128
         self.raw_seq = 0           # 原图帧序号（单调递增）
         self.raw_fps = 0.0         # 实际采集帧率
         self.cam_size = (0, 0)     # 相机实际分辨率 (W,H)
@@ -36,17 +38,25 @@ class SharedState:
         self.sr_ms = 0.0           # 最近一次推理耗时(ms)
         self.infer_fps = 0.0       # 实际推理帧率
 
-    # -- 原图读写 --
-    def set_raw(self, frame: np.ndarray) -> None:
+    def set_raw(self, frame: np.ndarray, uv: np.ndarray | None = None) -> None:
         with self._lock:
             self.raw_frame = frame
+            if uv is None and frame is not None:
+                h, w = frame.shape[:2]
+                uv = np.full((h, w, 2), 128, dtype=np.uint8)
+            self.raw_uv = uv
             self.raw_seq += 1
 
     def get_raw(self) -> tuple:
+        """返回 (Y, seq)。兼容旧调用。"""
         with self._lock:
             return self.raw_frame, self.raw_seq
 
-    # -- 超分结果读写 --
+    def get_raw_yuv(self) -> tuple:
+        """返回 (Y, UV, seq)。"""
+        with self._lock:
+            return self.raw_frame, self.raw_uv, self.raw_seq
+
     def set_sr(self, frame: np.ndarray, seq: int, ms: float) -> None:
         with self._lock:
             self.sr_frame = frame
@@ -74,26 +84,35 @@ def list_cameras(max_index: int = 6) -> list[dict]:
 
 
 def extract_gray(frame: np.ndarray, cam_w: int, cam_h: int):
-    """从相机原始帧提取 8-bit 灰度图 (cam_h, cam_w)。
+    """兼容旧接口：只返回 Y。新代码请用 extract_yuy2_planes。"""
+    planes = extract_yuy2_planes(frame, cam_w, cam_h)
+    return None if planes is None else planes[0]
 
-    支持两种输入：
-      - 原始 YUY2 缓冲 (1, W*H*2) uint8  → 取 Y 亮度平面
-      - 已是灰度 (H,W) uint8             → 直接返回
+
+def extract_yuy2_planes(frame: np.ndarray, cam_w: int, cam_h: int):
+    """从相机原始帧提取 Y (H,W) 与 UV (H,W,2)。
+
+    支持：
+      - 原始 YUY2 缓冲 size==W*H*2
+      - 已是灰度 (H,W) → UV 填 128
     返回 None 表示空帧/平坦帧（需跳过）。
     """
     n = int(frame.size)
     if n == cam_w * cam_h * 2:                       # YUY2
-        b = frame.tobytes()
-        y = np.frombuffer(b[0::2], np.uint8).reshape(cam_h, cam_w)
+        try:
+            y, u, v = yuv_codec.split_yuy2(frame, cam_w, cam_h)
+        except ValueError:
+            return None
+        uv = np.stack([u, v], axis=-1)
     elif n == cam_w * cam_h:                          # 已是灰度
-        y = frame.reshape(cam_h, cam_w)
+        y = np.asarray(frame, dtype=np.uint8).reshape(cam_h, cam_w)
+        uv = np.full((cam_h, cam_w, 2), 128, dtype=np.uint8)
     else:
         return None
 
-    # 空帧过滤：上电预热期全 0 / 全 128 的平坦帧跳过
     if y.max() == y.min():
         return None
-    return y
+    return y, uv
 
 
 class FrameSource:
@@ -109,11 +128,11 @@ class FrameSource:
         self._thread = None
         self._fps_window = []
         self._last_t = time.perf_counter()
-        self.cam_w = 0                # 相机实际分辨率（打开后读取）
+        self.cam_w = 0
         self.cam_h = 0
-        self._paused = False          # 手动断开（暂停采集）标志
+        self._paused = False
         self._pause_lock = threading.Lock()
-        self._control_hold = threading.Event()  # 快门校正期间让出 VideoCapture
+        self._control_hold = threading.Event()
 
         if source:
             if source.startswith("image:"):
@@ -139,16 +158,13 @@ class FrameSource:
             else:
                 raise ValueError("--source 必须是 'image:<path>' 或 'video:<path>'")
 
-    # ------------------------------------------------------------------
     def start(self) -> None:
         if self.mode == "camera":
-            # 热插拔：不在此阻塞/抛错，由采集线程负责打开与自动重连
             config.log(f"摄像头线程启动: index={self.cam_index}（热插拔自动重连）")
         self._thread = threading.Thread(target=self._loop, daemon=True, name="frame-source")
         self._thread.start()
 
     def _open_camera(self) -> bool:
-        """打开摄像头并读取实际分辨率。返回是否成功。"""
         if self._cap is not None:
             return True
         cap = cv2.VideoCapture(self.cam_index, cv2.CAP_MSMF)
@@ -164,10 +180,12 @@ class FrameSource:
         config.log(f"摄像头已打开: index={self.cam_index}, {self.cam_w}x{self.cam_h}")
         return True
 
+    def _neutral_uv(self, h: int, w: int) -> np.ndarray:
+        return np.full((h, w, 2), 128, dtype=np.uint8)
+
     def _loop(self) -> None:
         fail = 0
         while self.state.running:
-            # 手动断开：释放采集、挂起线程，等 resume() 恢复
             if self._paused:
                 if self._cap is not None:
                     self._cap.release()
@@ -181,21 +199,22 @@ class FrameSource:
                 if self._cap is not None:
                     self._cap.release()
                     self._cap = None
-                    config.log("摄像头已让出（快门校正）")
+                    config.log("摄像头已让出（相机控制）")
                 time.sleep(0.05)
                 continue
             gray = None
+            uv = None
             if self.mode == "camera":
                 if self._cap is None:
                     if self._open_camera():
                         fail = 0
-                        continue                     # 刚打开，立即取帧
-                    time.sleep(1.0)                  # 重连间隔
+                        continue
+                    time.sleep(1.0)
                     continue
                 ok, frame = self._cap.read()
                 if not ok or frame is None:
                     fail += 1
-                    if fail >= 10:                   # 持续失败 → 判定断开，释放重连
+                    if fail >= 10:
                         config.log("摄像头断开，尝试重连...")
                         self._cap.release()
                         self._cap = None
@@ -203,26 +222,29 @@ class FrameSource:
                         with self.state._lock:
                             self.state.cam_size = (0, 0)
                     else:
-                        time.sleep(0.2)              # 短暂失败退避，避免忙循环
+                        time.sleep(0.2)
                     continue
                 fail = 0
-                gray = extract_gray(frame, self.cam_w, self.cam_h)
-                if gray is None:                     # 预热期空帧，跳过
+                planes = extract_yuy2_planes(frame, self.cam_w, self.cam_h)
+                if planes is None:
                     time.sleep(0.02)
                     continue
+                gray, uv = planes
             elif self.mode == "image":
                 gray = self._static_frame
-                time.sleep(1.0 / 15.0)               # 静态图模拟 ~15fps
+                uv = self._neutral_uv(gray.shape[0], gray.shape[1])
+                time.sleep(1.0 / 15.0)
             else:  # video
                 ok, frame = self._cap.read()
                 if not ok:
-                    self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)   # 循环播放
+                    self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                     continue
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                uv = self._neutral_uv(gray.shape[0], gray.shape[1])
 
             if gray is None:
                 continue
-            self.state.set_raw(gray)
+            self.state.set_raw(gray, uv)
             self._update_fps()
 
     def _update_fps(self) -> None:
@@ -240,23 +262,19 @@ class FrameSource:
         self._cap = None
 
     def pause(self) -> None:
-        """手动断开相机：释放设备并暂停采集线程（不退出线程）。"""
         with self._pause_lock:
             self._paused = True
         config.log("camera pause requested")
 
     def resume(self) -> None:
-        """重新连接相机：恢复采集线程（热插拔逻辑自动重开设备）。"""
         with self._pause_lock:
             self._paused = False
         if self.mode != "camera":
-            # 静态图/视频源：恢复分辨率标记
             with self.state._lock:
                 self.state.cam_size = (self.cam_w, self.cam_h)
         config.log("camera resume requested")
 
     def release_for_control(self, timeout: float = 3.0) -> bool:
-        """暂停 OpenCV 取流并释放设备，供机芯 USB 命令通道占用。不改 cam_size。"""
         self._control_hold.set()
         t0 = time.perf_counter()
         while (time.perf_counter() - t0) < timeout:
@@ -266,5 +284,4 @@ class FrameSource:
         return self._cap is None
 
     def resume_after_control(self) -> None:
-        """快门校正结束后恢复 OpenCV 采集。"""
         self._control_hold.clear()

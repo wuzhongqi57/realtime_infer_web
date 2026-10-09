@@ -1,7 +1,7 @@
 """集中配置 — 所有路径/参数默认值都在这里，可被 CLI 参数覆盖。
 
-约定（规则2）：默认路径尽量相对项目根目录；MODELS_DIR 例外，是用户明确指定的
-默认模型目录（/path/to/models），集中在此定义并通过 `--models-dir` 可覆盖。
+约定：默认路径尽量相对项目根目录。模型目录可用环境变量 MODELS_DIR
+或 `--models-dir` 覆盖。
 """
 
 import os
@@ -15,7 +15,7 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 # 服务器
 # ---------------------------------------------------------------------------
 HOST = "127.0.0.1"
-PORT = 5001            # 注：5000 已被 image_fusion_tool 长期占用，避免冲突
+PORT = 5001            # 避开 Image-Tool 默认使用的 5000 端口
 
 # ---------------------------------------------------------------------------
 # 摄像头（红外，分辨率自适应：256×192 或 640×512，启动时按实际设备读取）
@@ -27,19 +27,13 @@ CAM_API = "MSMF"             # 该 IR 相机必须用 MSMF（DSHOW 无法打开�
 # ---------------------------------------------------------------------------
 # 模型（目录内所有 .pth 均可选，每个面板独立选择显示哪个模型的效果）
 # ---------------------------------------------------------------------------
-MODELS_DIR = r"/path/to/models"    # 模型目录（用户指定默认，可用 --models-dir 覆盖）
-RAW_LABEL = "原图"                # 面板可选项之一：显示原始图像（最近邻放大）
+MODELS_DIR = os.environ.get("MODELS_DIR", os.path.join(PROJECT_ROOT, "models"))  # 可用 --models-dir 覆盖
+RAW_LABEL = "原图"                # 面板可选项之一：显示原始图像（最近邻放大到面板）
 
-# 各系列模型的期望输入尺寸（按模型名关键字匹配，先长后短）。
-# 推理前会把相机帧缩放为该模型的输入尺寸：640 系列 ← 640×512，256 系列 ← 256×192。
-# 按权重文件名中的关键字匹配
-# （关键字见下表）
+# 模型期望输入尺寸：按权重文件名中包含的关键字匹配（按列表顺序，先长后短）。
+# 推理前会把相机帧缩放为该模型的输入尺寸：名字含 640 ← 640×512，含 256 ← 256×192。
 MODEL_INPUT_SIZES = [
     ("640", (640, 512)),
-    ("256", (256, 192)),
-    ("640", (640, 512)),
-    ("640", (640, 512)),
-    ("256", (256, 192)),
     ("256", (256, 192)),
 ]
 DEFAULT_INPUT_SIZE = (640, 512)   # 名字不含已知关键字的模型使用此默认输入
@@ -47,15 +41,21 @@ DEFAULT_INPUT_SIZE = (640, 512)   # 名字不含已知关键字的模型使用�
 DEFAULT_DEVICE = "cpu"            # "cpu" 或 "cuda"
 
 # ---------------------------------------------------------------------------
-# 机芯命令 SDK（手动快门 / FFC）
+# HAT（重模型：直播不推理；拍照即时；录像停止后离线超分）
 # ---------------------------------------------------------------------------
-IRS_SDK_DIR = os.environ.get(
-    "IRS_SDK_DIR",
-    r"C:\path\to\camera_sdk",
+HAT_LABEL = "HAT×4"
+HAT_SCALE = 4
+# 默认指向同级目录下 Image-Tool 仓库（https://github.com/wuzhongqi57/Image-Tool）的
+# model_zoo/hat/ 权重；可用 --hat-weights / --fusion-root / 环境变量覆盖
+FUSION_TOOL_ROOT = os.environ.get(
+    "FUSION_TOOL_ROOT",
+    os.path.join(os.path.dirname(PROJECT_ROOT), "image_fusion_tool"),
 )
-IR_USB_VID = 0x0000
-IR_USB_PID = 0x0000
-FFC_SETTLE_S = 1.5                 # 打快门后等待挡板打开再恢复采集
+HAT_WEIGHTS = os.environ.get(
+    "HAT_WEIGHTS",
+    os.path.join(FUSION_TOOL_ROOT, "model_zoo", "hat", "Real_HAT_GAN_SRx4_sharper.pth"),
+)
+HAT_DEVICE = os.environ.get("HAT_DEVICE", "")  # 空则跟随 --device / DEFAULT_DEVICE
 
 # ---------------------------------------------------------------------------
 # 推流
