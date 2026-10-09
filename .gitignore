@@ -1,4 +1,4 @@
-﻿__pycache__/
+__pycache__/
 *.pyc
 *.pyo
 output/
@@ -10,13 +10,27 @@ venv/
 env/
 .venv/
 
-# Model weights (keep local / /path/to/models — see README)
+# Model weights / vendor binaries (keep local — see README)
 *.pth
 *.pt
 *.ckpt
 *.safetensors
+*.onnx
+*.dll
+*.lib
 models/
+
+# Raw frame dumps
+*.yuy2
+*.yuy2.json
+
+# Local-only docs
+docs/
 
 # Local backups
 *.bak
 *.bak_*
+
+# Vendor camera-control plugin (keep local)
+plugins/local.py
+plugins/local/
