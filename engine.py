@@ -10,12 +10,16 @@
   - 所有模型均可选择，无论相机分辨率如何
 
 多面板共享：同一模型同一帧序号只推理一次，结果缓存在 _results。
+防重复推理：同模型同帧的并发请求会等待首次推理完成后复用结果。
+FP16 支持：CUDA 设备可启用半精度推理（通过 config.USE_FP16 或 --fp16 开关）。
 """
 
 import glob
 import os
 import threading
 import time
+from concurrent.futures import Future
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -105,12 +109,14 @@ def build_model(model_path: str) -> tuple[IE_Net, int, int]:
 # 模型注册表
 # ---------------------------------------------------------------------------
 class ModelHub:
-    def __init__(self, models_dir: str, device: str = "cpu"):
+    def __init__(self, models_dir: str, device: str = "cpu", use_fp16: bool = False):
         self.models_dir = models_dir
         self.device = torch.device(device)
+        self.use_fp16 = use_fp16 and device == "cuda"
         self.infos = []         # [{name, path}]，由 rescan() 填充
         self._engines = {}      # name -> (model, scale)
-        self._results = {}      # name -> (seq, sr_uint8, ms)  按帧缓存，多面板共享
+        self._results = {}      # name -> (key, sr_uint8, ms)  按帧缓存，多面板共享
+        self._inflight = {}     # name -> (key, Future)  防止同模型同帧重复推理
         self._mtimes = {}       # name -> mtime，用于判断权重是否被替换
         self._lock = threading.Lock()
         self.rescan()
@@ -158,16 +164,22 @@ class ModelHub:
             if name not in self._engines:
                 path = next(i["path"] for i in self.infos if i["name"] == name)
                 model, first_dim, scale = build_model(path)
-                model = model.to(self.device)   # 移到推理设备（GPU 必需）
-                # 按该模型期望输入尺寸预热，消除首次推理开销
+                model = model.to(self.device)
+                # FP16 mode for CUDA
+                dtype_str = "fp32"
+                if self.use_fp16 and self.device.type == "cuda":
+                    model = model.half()
+                    dtype_str = "fp16"
+                # Warmup with model's expected input size
                 input_w, input_h = resolve_input_size(name)
-                dummy = torch.randn(1, 1, input_h, input_w, device=self.device)
+                dtype = torch.float16 if (self.use_fp16 and self.device.type == "cuda") else torch.float32
+                dummy = torch.randn(1, 1, input_h, input_w, device=self.device, dtype=dtype)
                 with torch.no_grad():
                     model(dummy)
                 self._engines[name] = (model, scale)
                 n = sum(p.numel() for p in model.parameters())
                 config.log(f"模型已加载: {name} (dim={first_dim}, x{scale}, "
-                           f"输入 {input_w}x{input_h}, {n/1e6:.3f}M, {self.device})")
+                           f"输入 {input_w}x{input_h}, {n/1e6:.3f}M, {self.device}, {dtype_str})")
             return self._engines[name]
 
     def infer(self, name: str, frame: np.ndarray, seq: int,
@@ -175,28 +187,68 @@ class ModelHub:
         """推理一帧。自动把帧缩放到模型期望输入尺寸。返回 (sr_uint8, ms)。
 
         cache_tag 区分同一帧上的不同输入（原始 Y 与伪彩 Y' 不能共用缓存）。
+        防重复推理：同模型同帧的并发请求会等待首次推理完成后复用结果。
         """
         key = (seq, cache_tag)
+        # Fast path: check cached result
         with self._lock:
             hit = self._results.get(name)
             if hit is not None and hit[0] == key:
                 return hit[1], hit[2]
+            # Check if inference is already in flight
+            inflight = self._inflight.get(name)
+            if inflight is not None and inflight[0] == key:
+                future = inflight[1]
+            else:
+                future = None
 
-        model, scale = self._get_engine(name)
-        input_w, input_h = resolve_input_size(name)
-        if frame.shape != (input_h, input_w):
-            # 降采样用 INTER_AREA 保质量，升采样用 INTER_LINEAR
-            interp = cv2.INTER_AREA if frame.shape[0] >= input_h else cv2.INTER_LINEAR
-            frame = cv2.resize(frame, (input_w, input_h), interpolation=interp)
+        # Wait for in-flight inference if another thread started it
+        if future is not None:
+            try:
+                return future.result(timeout=5.0)
+            except Exception:
+                pass  # Fall through to run inference ourselves
 
-        tensor = torch.from_numpy(frame.astype(np.float32) / 255.0)
-        tensor = tensor.unsqueeze(0).unsqueeze(0).to(self.device)
-        t0 = time.perf_counter()
-        with torch.no_grad():
-            out = model(tensor)
-        ms = (time.perf_counter() - t0) * 1000.0
-        sr = out.squeeze().clamp(0.0, 1.0).mul(255.0).byte().cpu().numpy()
-
+        # Prepare future for other threads to wait on
+        my_future: Future = Future()
         with self._lock:
-            self._results[name] = (key, sr, ms)
-        return sr, ms
+            # Double-check cache after acquiring lock
+            hit = self._results.get(name)
+            if hit is not None and hit[0] == key:
+                return hit[1], hit[2]
+            self._inflight[name] = (key, my_future)
+
+        try:
+            model, scale = self._get_engine(name)
+            input_w, input_h = resolve_input_size(name)
+            if frame.shape != (input_h, input_w):
+                interp = cv2.INTER_AREA if frame.shape[0] >= input_h else cv2.INTER_LINEAR
+                frame = cv2.resize(frame, (input_w, input_h), interpolation=interp)
+
+            # FP16 or FP32 tensor based on model dtype
+            use_half = self.use_fp16 and self.device.type == "cuda"
+            tensor = torch.from_numpy(frame.astype(np.float32) / 255.0)
+            tensor = tensor.unsqueeze(0).unsqueeze(0).to(self.device)
+            if use_half:
+                tensor = tensor.half()
+
+            t0 = time.perf_counter()
+            with torch.no_grad():
+                out = model(tensor)
+            ms = (time.perf_counter() - t0) * 1000.0
+            sr = out.float().squeeze().clamp(0.0, 1.0).mul(255.0).byte().cpu().numpy()
+
+            with self._lock:
+                self._results[name] = (key, sr, ms)
+                if self._inflight.get(name) == (key, my_future):
+                    del self._inflight[name]
+
+            result = (sr, ms)
+            my_future.set_result(result)
+            return result
+        except Exception as e:
+            my_future.set_exception(e)
+            with self._lock:
+                if self._inflight.get(name) == (key, my_future):
+                    del self._inflight[name]
+            raise

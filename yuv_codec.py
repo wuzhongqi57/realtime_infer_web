@@ -138,7 +138,11 @@ def yuy2_to_bgr(buf: np.ndarray, width: int, height: int) -> np.ndarray:
 
 
 def gray_to_bgr(gray: np.ndarray) -> np.ndarray:
-    return cv2.cvtColor(np.asarray(gray, dtype=np.uint8), cv2.COLOR_GRAY2BGR)
+    """Grayscale to BGR. Ensures contiguous array for cv2."""
+    gray = np.asarray(gray, dtype=np.uint8)
+    if not gray.flags['C_CONTIGUOUS']:
+        gray = np.ascontiguousarray(gray)
+    return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
 
 
 def roundtrip_ok(y: np.ndarray) -> bool:

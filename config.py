@@ -62,6 +62,25 @@ HAT_DEVICE = os.environ.get("HAT_DEVICE", "")  # 空则跟随 --device / DEFAULT
 # ---------------------------------------------------------------------------
 JPEG_QUALITY = 80
 
+# Stream downscaling: max dimensions for live stream (aspect preserved).
+# Full resolution still used for snapshots/recordings.
+# Default fits within 1280x1024; set to 0 to disable.
+STREAM_MAX_WIDTH = 1280
+STREAM_MAX_HEIGHT = 1024
+
+# ---------------------------------------------------------------------------
+# FP16 Inference
+# ---------------------------------------------------------------------------
+# Use FP16 (half precision) on CUDA for faster inference. Negligible quality loss.
+# Default: True for CUDA (auto-fallback to FP32 on CPU or if unavailable)
+USE_FP16 = True
+
+# ---------------------------------------------------------------------------
+# Stats Overlay
+# ---------------------------------------------------------------------------
+# Show per-panel stats (FPS, render ms, frame age) - toggled via toolbar or ?stats=1
+STATS_OVERLAY = False
+
 # ---------------------------------------------------------------------------
 # 辅助
 # ---------------------------------------------------------------------------

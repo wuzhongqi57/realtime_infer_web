@@ -144,6 +144,13 @@
   .dot.ok { background: var(--accent); }
   .dot.warn { background: var(--warn); }
   .dot.bad { background: var(--bad); }
+  .stats-overlay {
+    position: absolute; top: 8px; left: 8px; z-index: 10;
+    background: rgba(0,0,0,0.6); color: #0f0; font-size: 11px;
+    padding: 4px 8px; border-radius: 4px; font-family: monospace;
+    pointer-events: none; display: none;
+  }
+  .stats-overlay.visible { display: block; }
 </style>
 </head>
 <body>
@@ -177,6 +184,7 @@
     <button id="btn-record" title="开始/停止录像">● 录像</button>
     <button id="btn-ffc" title="合上挡板做一次快门校正（FFC）" style="display:none">快门校正</button>
     <button id="btn-cam-toggle" title="断开/重新连接摄像头">🔌 断开相机</button>
+    <button id="btn-stats" title="显示/隐藏统计信息（FPS/延迟）">📊 统计</button>
   </span>
 </header>
 
@@ -191,9 +199,15 @@
   const $ = id => document.getElementById(id);
   const mainEl = $('main');
 
+  // Global state
+  let statsEnabled = new URLSearchParams(location.search).has('stats');
+
   // ---- 面板流（每条 WebSocket 对应一个面板）----
-  function createPanel(select, canvas, ctx, fcEls) {
+  function createPanel(select, canvas, ctx, fcEls, statsEl) {
     let ws = null, current = null, closed = false;
+    let decoding = false;  // Frame dropping: skip if decode in flight
+    let pendingData = null;  // Latest frame data (drop older ones)
+    let frameCount = 0, lastFpsTime = performance.now(), displayFps = 0;
 
     function getFalseColor() {
       return {
@@ -204,7 +218,7 @@
     }
     function sendState() {
       if (ws && ws.readyState === WebSocket.OPEN && current) {
-        ws.send(JSON.stringify({ model: current, false_color: getFalseColor() }));
+        ws.send(JSON.stringify({ model: current, false_color: getFalseColor(), stats: statsEnabled }));
       }
     }
 
@@ -215,6 +229,83 @@
       canvas.style.imageRendering = raw ? 'pixelated' : 'auto';
     }
 
+    function updateStats(stats) {
+      if (!statsEnabled || !statsEl) return;
+      frameCount++;
+      const now = performance.now();
+      if (now - lastFpsTime >= 1000) {
+        displayFps = Math.round(frameCount * 1000 / (now - lastFpsTime));
+        frameCount = 0;
+        lastFpsTime = now;
+      }
+      const age = stats ? Date.now() - stats.ts : 0;
+      const infer = stats ? stats.infer_ms : 0;
+      const render = stats ? stats.render_ms : 0;
+      statsEl.textContent = `FPS: ${displayFps} | 渲染: ${render}ms | 推理: ${infer}ms | 延迟: ${age}ms`;
+    }
+
+    function sendAck() {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ ack: true }));
+      }
+    }
+
+    function processFrame(data) {
+      // Ack on receipt (before decode) to allow pipelining - server can
+      // start rendering next frame while we decode this one
+      sendAck();
+
+      if (decoding) {
+        pendingData = data;  // Drop: keep only newest
+        return;
+      }
+      decoding = true;
+
+      // Parse stats header if present (4-byte little-endian length prefix)
+      let stats = null, jpegData = data;
+      if (data instanceof ArrayBuffer && data.byteLength > 4) {
+        const arr = new Uint8Array(data);
+        const dv = new DataView(data);
+        const headerLen = dv.getUint32(0, true);  // little-endian
+        if (headerLen > 0 && headerLen < 500 && 4 + headerLen < data.byteLength) {
+          try {
+            const headerStr = new TextDecoder().decode(arr.slice(4, 4 + headerLen));
+            stats = JSON.parse(headerStr);
+            jpegData = arr.slice(4 + headerLen).buffer;
+          } catch (e) {
+            // Fallback: try legacy newline format for compatibility
+            const nlIdx = arr.indexOf(10);
+            if (nlIdx > 0 && nlIdx < 200) {
+              try {
+                const headerStr = new TextDecoder().decode(arr.slice(0, nlIdx));
+                stats = JSON.parse(headerStr);
+                jpegData = arr.slice(nlIdx + 1).buffer;
+              } catch (e2) {}
+            }
+          }
+        }
+      }
+
+      const blob = new Blob([jpegData], { type: 'image/jpeg' });
+      createImageBitmap(blob).then(bmp => {
+        applyDisplayMode();
+        ctx.drawImage(bmp, 0, 0, canvas.width, canvas.height);
+        bmp.close();
+        updateStats(stats);
+      }).catch(err => {
+        // Decode error - frame corrupted or invalid
+        console.warn('Frame decode error:', err);
+      }).finally(() => {
+        decoding = false;
+        // Process pending frame if any (newest only)
+        if (pendingData) {
+          const next = pendingData;
+          pendingData = null;
+          processFrame(next);
+        }
+      });
+    }
+
     function open() {
       if (closed) return;
       ws = new WebSocket(`ws://${location.host}/ws/panel`);
@@ -222,12 +313,7 @@
       ws.onopen = () => sendState();
       ws.onmessage = e => {
         if (typeof e.data === 'string') return;
-        const blob = new Blob([e.data], { type: 'image/jpeg' });
-        createImageBitmap(blob).then(bmp => {
-          applyDisplayMode();
-          ctx.drawImage(bmp, 0, 0, canvas.width, canvas.height);
-          bmp.close();
-        }).catch(() => {});
+        processFrame(e.data);
       };
       ws.onclose = () => { if (!closed) setTimeout(open, 1000); };
       ws.onerror = () => ws.close();
@@ -248,7 +334,9 @@
       setModel: m => { current = m; select.value = m; applyDisplayMode(); sendState(); },
       getModel: () => current,
       getFalseColor,
-      close: () => { closed = true; if (ws) ws.close(); }
+      close: () => { closed = true; if (ws) ws.close(); },
+      sendUpdate: sendState,
+      setStatsVisible: v => { if (statsEl) statsEl.classList.toggle('visible', v); }
     };
   }
 
@@ -313,10 +401,11 @@
           `<option value="uv">UV插值</option>` +
         `</select>` +
       `</div>` +
-      `<div class="stage"><canvas width="1024" height="768"></canvas></div>`;
+      `<div class="stage"><div class="stats-overlay"></div><canvas width="1024" height="768"></canvas></div>`;
     mainEl.appendChild(el);
     const select = el.querySelector('.model-select');
     const canvas = el.querySelector('canvas');
+    const statsEl = el.querySelector('.stats-overlay');
     const ctx = canvas.getContext('2d');
     const fcEls = {
       en: el.querySelector('.fc-en'),
@@ -324,7 +413,7 @@
       mode: el.querySelector('.fc-mode'),
     };
     if (n === 2) fcEls.mode.value = 'uv';
-    const api = createPanel(select, canvas, ctx, fcEls);
+    const api = createPanel(select, canvas, ctx, fcEls, statsEl);
     fillSelect(select);
     applyPanelSize(canvas);
     // 默认：面板1=原图；面板2起依次选不同模型（不够则复用最后一个）
@@ -333,7 +422,8 @@
       defaultModel = currentOptions[Math.min(n - 2, currentOptions.length - 1)];
     }
     api.setModel(defaultModel);
-    const panel = { el, select, canvas, ctx, api };
+    api.setStatsVisible(statsEnabled);
+    const panel = { el, select, canvas, ctx, api, statsEl };
     select.addEventListener('change', () => updateHeavyBadge(panel));
     panels.push(panel);
     updateHeavyBadge(panel);
@@ -676,6 +766,18 @@
       }
     } catch (e) { toast('相机操作失败: ' + e.message, false); }
   });
+
+  // Stats toggle
+  $('btn-stats').addEventListener('click', () => {
+    statsEnabled = !statsEnabled;
+    $('btn-stats').classList.toggle('on', statsEnabled);
+    for (const p of panels) {
+      if (p.api.setStatsVisible) p.api.setStatsVisible(statsEnabled);
+      if (p.api.sendUpdate) p.api.sendUpdate();
+    }
+  });
+  // Initialize stats button state
+  if (statsEnabled) $('btn-stats').classList.add('on');
 
   init();
   poll();

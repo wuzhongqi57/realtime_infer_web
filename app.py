@@ -17,9 +17,11 @@
 import argparse
 import json
 import os
+import queue
 import re
 import threading
 import time
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -51,6 +53,32 @@ hub = None
 source = None          # 全局视频源（拍照/录像/相机控制 API 使用）
 _cached_cam_key = None         # 面板尺寸按相机分辨率缓存（更换相机时才重算）
 _panel_size = (0, 0)
+
+# Stream size for live view (downscaled for bandwidth, full res for snapshots/recordings)
+_stream_max_w = config.STREAM_MAX_WIDTH
+_stream_max_h = config.STREAM_MAX_HEIGHT
+
+# Frame condition for efficient waiting (instead of polling)
+_frame_cond = threading.Condition()
+_frame_seq = 0
+
+
+def _notify_frame():
+    """Notify all WebSocket threads that a new frame is available."""
+    global _frame_seq
+    with _frame_cond:
+        _frame_seq += 1
+        _frame_cond.notify_all()
+
+
+def _compute_stream_size(src_w: int, src_h: int) -> tuple[int, int]:
+    """Compute stream output size that fits within max bounds while preserving aspect."""
+    if not _stream_max_w or not _stream_max_h:
+        return src_w, src_h
+    if src_w <= _stream_max_w and src_h <= _stream_max_h:
+        return src_w, src_h
+    scale = min(_stream_max_w / src_w, _stream_max_h / src_h)
+    return int(src_w * scale), int(src_h * scale)
 
 
 def _get_panel_size() -> tuple[int, int]:
@@ -175,108 +203,289 @@ def _jpeg(frame: np.ndarray) -> bytes:
 
 
 def _render(name: str, frame: np.ndarray, seq: int,
-            hat_hold: dict | None = None, fc: dict | None = None) -> bytes:
-    """按面板选择渲染一帧为 JPEG。伪彩设置来自该面板，不共用全局。"""
+            hat_hold: dict | None = None, fc: dict | None = None,
+            for_stream: bool = True) -> tuple[bytes, float]:
+    """按面板选择渲染一帧为 JPEG。伪彩设置来自该面板，不共用全局。
+
+    for_stream=True: 先缩放灰度到流尺寸，再上色（快）
+    for_stream=False: 保持面板原尺寸，全分辨率上色
+
+    Optimizations for GIL: ensure arrays are contiguous before cv2 calls,
+    minimize intermediate allocations, release references early.
+
+    Returns: (jpeg_bytes, inference_ms)
+    """
     panel_w, panel_h = _get_panel_size()
     view = _resolve_fc(fc)
     pal = view["effective"]
+    infer_ms = 0.0
 
-    def _fit(bgr: np.ndarray, nearest: bool = False) -> np.ndarray:
-        if panel_h and (bgr.shape[0], bgr.shape[1]) != (panel_h, panel_w):
+    # Pre-compute stream size once
+    stream_w, stream_h = _compute_stream_size(panel_w, panel_h) if for_stream else (0, 0)
+
+    def _fit_gray(y: np.ndarray, nearest: bool = False) -> np.ndarray:
+        """Scale grayscale to panel size."""
+        if panel_h and (y.shape[0], y.shape[1]) != (panel_h, panel_w):
             interp = cv2.INTER_NEAREST if nearest else cv2.INTER_LINEAR
-            bgr = cv2.resize(bgr, (panel_w, panel_h), interpolation=interp)
+            # Ensure contiguous for cv2
+            y = np.ascontiguousarray(y)
+            y = cv2.resize(y, (panel_w, panel_h), interpolation=interp)
+        return y
+
+    def _stream_scale_gray(y: np.ndarray) -> np.ndarray:
+        """Scale grayscale to stream size."""
+        if not for_stream or not stream_w:
+            return y
+        h, w = y.shape[:2]
+        if (stream_w, stream_h) != (w, h):
+            interp = cv2.INTER_AREA if w > stream_w else cv2.INTER_LINEAR
+            y = np.ascontiguousarray(y)
+            y = cv2.resize(y, (stream_w, stream_h), interpolation=interp)
+        return y
+
+    def _stream_scale_bgr(bgr: np.ndarray) -> np.ndarray:
+        """Scale BGR to stream size (for UV mode which produces BGR directly)."""
+        if not for_stream or not stream_w:
+            return bgr
+        h, w = bgr.shape[:2]
+        if (stream_w, stream_h) != (w, h):
+            interp = cv2.INTER_AREA if w > stream_w else cv2.INTER_LINEAR
+            bgr = np.ascontiguousarray(bgr)
+            bgr = cv2.resize(bgr, (stream_w, stream_h), interpolation=interp)
         return bgr
 
-    if name == config.RAW_LABEL or (view["mode"] == "uv" and not _is_heavy(name)):
-        if view["mode"] == "uv":
-            y_fc, u, v = false_color.lut_to_yuv(frame, pal)
-            if name == config.RAW_LABEL:
-                y_hr = y_fc
-            else:
-                y_hr, _ = hub.infer(name, y_fc, seq, cache_tag="uv:" + pal)
-            bgr, _ = false_color.attach_uv(y_hr, u, v)
+    # UV mode: uses lut_to_yuv which transforms Y already, need BGR scaling
+    if view["mode"] == "uv" and not _is_heavy(name):
+        y_fc, u, v = false_color.lut_to_yuv(frame, pal)
+        if name == config.RAW_LABEL:
+            y_hr = y_fc
         else:
-            bgr = false_color.apply_to_bgr(frame, pal)
-        # 原图放大到面板用最近邻，避免双线性抹掉像素块
-        return _jpeg(_fit(bgr, nearest=(name == config.RAW_LABEL)))
+            y_hr, infer_ms = hub.infer(name, y_fc, seq, cache_tag="uv:" + pal)
+        bgr, _ = false_color.attach_uv(y_hr, u, v)
+        bgr = _stream_scale_bgr(bgr)
+        return _jpeg(bgr), infer_ms
+
+    # Raw or regular models: scale grayscale first, then apply palette (fast!)
+    if name == config.RAW_LABEL:
+        y_out = _fit_gray(frame, nearest=True)
+        y_out = _stream_scale_gray(y_out)
+        bgr = false_color.apply_to_bgr(y_out, pal)
+        return _jpeg(bgr), 0.0
+
     if _is_heavy(name):
         if hat_hold is not None:
             if hat_hold.get("jpeg") is None:
                 ph = hat_backend.make_placeholder(frame, (panel_w, panel_h))
                 if ph.ndim == 2:
+                    ph = _stream_scale_gray(ph)
                     ph = false_color.apply_to_bgr(ph, pal)
                 hat_hold["jpeg"] = _jpeg(ph)
-            return hat_hold["jpeg"] or b""
+            return hat_hold["jpeg"] or b"", 0.0
         ph = hat_backend.make_placeholder(frame, (panel_w, panel_h))
         if ph.ndim == 2:
+            ph = _stream_scale_gray(ph)
             ph = false_color.apply_to_bgr(ph, pal)
-        return _jpeg(ph)
-    sr, _ = hub.infer(name, frame, seq)
+        return _jpeg(ph), 0.0
+
+    # Regular model: infer, scale grayscale to stream size, then colorize
+    sr, infer_ms = hub.infer(name, frame, seq)
+    sr_h, sr_w = sr.shape[:2]
+    # Fit to panel if needed (for cross-resolution models)
+    if panel_h and (sr_h, sr_w) != (panel_h, panel_w):
+        interp = cv2.INTER_AREA if sr_h > panel_h else cv2.INTER_LINEAR
+        sr = np.ascontiguousarray(sr)
+        sr = cv2.resize(sr, (panel_w, panel_h), interpolation=interp)
+    # Scale grayscale to stream size FIRST, then apply palette (fast!)
+    sr = _stream_scale_gray(sr)
     bgr = false_color.apply_to_bgr(sr, pal)
-    return _jpeg(_fit(bgr))
+    return _jpeg(bgr), infer_ms
 
 
 # ---------------------------------------------------------------------------
 # WebSocket — 单一面板流（二进制 JPEG 帧）
 # ---------------------------------------------------------------------------
-@sock.route("/ws/panel")
-def ws_panel(ws):
-    selected = config.RAW_LABEL
-    last_seq = 0
-    fc_spec = {"enabled": False, "palette": "ironbow", "mode": "lut"}
-    hat_hold = {"jpeg": None, "palette": None}
-    while ws.connected:
-        msg = ws.receive(timeout=0.02)
-        if msg:
+
+class PanelSession:
+    """Per-panel WebSocket session with non-blocking control message handling.
+
+    Flow control strategy: ack-on-receipt allows pipelining (server can render
+    next frame while client decodes), keeping latency flat at camera rate.
+    Server-side ack timeout (500ms) prevents stalls from lost acks.
+    """
+
+    ACK_TIMEOUT_MS = 500  # Reset client_ready if no ack received
+
+    def __init__(self, ws):
+        self.ws = ws
+        self.selected = config.RAW_LABEL
+        self.fc_spec = {"enabled": False, "palette": "ironbow", "mode": "lut"}
+        self.hat_hold = {"jpeg": None, "palette": None}
+        self.last_seq = 0
+        self.client_ready = True  # Flow control: client has acked last frame
+        self.stats_enabled = False
+        self._stop = threading.Event()
+        self._msg_queue: queue.Queue = queue.Queue()
+        self._wake = threading.Event()  # Per-session wake for ack
+        self._last_send_time = 0.0  # For ack timeout
+
+    def reader_thread(self):
+        """Read control messages from client without blocking render loop."""
+        try:
+            while not self._stop.is_set() and self.ws.connected:
+                try:
+                    msg = self.ws.receive(timeout=0.5)
+                    if msg:
+                        self._msg_queue.put(msg)
+                        self._wake.set()  # Wake render loop on any message
+                except Exception:
+                    break
+        except Exception:
+            pass
+        finally:
+            self._stop.set()
+            self._wake.set()
+
+    def process_messages(self) -> bool:
+        """Process queued control messages (non-blocking). Returns True if ack received."""
+        got_ack = False
+        while True:
+            try:
+                msg = self._msg_queue.get_nowait()
+            except queue.Empty:
+                break
             try:
                 d = json.loads(msg)
                 allowed = [config.RAW_LABEL] + _selectable_names()
                 if d.get("model") in allowed:
                     new_sel = d["model"]
-                    if new_sel != selected:
-                        selected = new_sel
-                        hat_hold = {"jpeg": None, "palette": None}
-                        last_seq = 0
+                    if new_sel != self.selected:
+                        self.selected = new_sel
+                        self.hat_hold = {"jpeg": None, "palette": None}
+                        self.last_seq = 0
                 if isinstance(d.get("false_color"), dict):
-                    fc_spec = d["false_color"]
-                    hat_hold = {"jpeg": None, "palette": None}
-                    last_seq = 0
+                    self.fc_spec = d["false_color"]
+                    self.hat_hold = {"jpeg": None, "palette": None}
+                    self.last_seq = 0
+                if d.get("ack"):
+                    self.client_ready = True
+                    got_ack = True
+                if "stats" in d:
+                    self.stats_enabled = bool(d["stats"])
             except Exception:
                 pass
+        return got_ack
 
-        frame, seq = state.get_raw()
-        if frame is None:
-            continue
-        view = _resolve_fc(fc_spec)
+    def _render_and_send(self, frame: np.ndarray, seq: int) -> bool:
+        """Render frame and send. Returns True on success."""
+        view = _resolve_fc(self.fc_spec)
         pal_key = f"{view['enabled']}:{view['effective']}:{view['mode']}"
-        if hat_hold.get("palette") != pal_key:
-            hat_hold = {"jpeg": None, "palette": pal_key}
-            last_seq = 0
+        if self.hat_hold.get("palette") != pal_key:
+            self.hat_hold = {"jpeg": None, "palette": pal_key}
 
-        if _is_heavy(selected) and hat_hold.get("jpeg") is not None:
-            if seq == last_seq:
-                continue
-            last_seq = seq
+        # For heavy models with cached placeholder, just resend
+        if _is_heavy(self.selected) and self.hat_hold.get("jpeg") is not None:
+            data = self.hat_hold["jpeg"]
+            infer_ms = 0.0
+            render_ms = 0.0
+        else:
+            frame_time = time.perf_counter()
+            # Copy frame outside any global lock to minimize GIL contention
+            frame = np.ascontiguousarray(frame)
             try:
-                ws.send(hat_hold["jpeg"])
-            except Exception:
-                break
-            continue
-        if seq == last_seq:
-            continue
-        last_seq = seq
+                data, infer_ms = _render(self.selected, frame, seq,
+                                         hat_hold=self.hat_hold, fc=self.fc_spec,
+                                         for_stream=True)
+                if self.hat_hold is not None:
+                    self.hat_hold["palette"] = pal_key
+            except Exception as exc:
+                config.log(f"渲染失败 ({self.selected}): {exc}")
+                return False
+            render_ms = (time.perf_counter() - frame_time) * 1000.0
+
+        if not data:
+            return False
+
+        # Build frame message with optional stats header (4-byte length prefix)
+        if self.stats_enabled:
+            stats = {
+                "seq": seq,
+                "render_ms": round(render_ms, 1),
+                "infer_ms": round(infer_ms, 1),
+                "ts": int(time.time() * 1000),
+            }
+            header = json.dumps(stats).encode()
+            # 4-byte little-endian length prefix + header + jpeg
+            prefix = len(header).to_bytes(4, "little")
+            data = prefix + header + data
+
         try:
-            data = _render(selected, frame, seq, hat_hold=hat_hold, fc=fc_spec)
-            if hat_hold is not None:
-                hat_hold["palette"] = pal_key
-        except Exception as exc:
-            config.log(f"渲染失败 ({selected}): {exc}")
-            continue
-        if data:
-            try:
-                ws.send(data)
-            except Exception:
-                break
+            self.ws.send(data)
+            self.last_seq = seq
+            self.client_ready = False
+            self._last_send_time = time.perf_counter()
+            return True
+        except Exception:
+            return False
+
+    def run(self):
+        """Main render loop - waits on frame condition or ack, whichever comes first."""
+        global _frame_seq
+        reader = threading.Thread(target=self.reader_thread, daemon=True)
+        reader.start()
+
+        try:
+            while not self._stop.is_set() and self.ws.connected:
+                # Check for ack timeout - reset client_ready if no ack for too long
+                if not self.client_ready and self._last_send_time > 0:
+                    elapsed_ms = (time.perf_counter() - self._last_send_time) * 1000.0
+                    if elapsed_ms > self.ACK_TIMEOUT_MS:
+                        self.client_ready = True  # Assume ack lost, continue
+
+                got_ack = self.process_messages()
+
+                # On ack, immediately try to render newest frame if available
+                if got_ack:
+                    frame, seq = state.get_raw()
+                    if frame is not None and seq > self.last_seq:
+                        if not self._render_and_send(frame, seq):
+                            break
+                        continue
+
+                # Wait for new frame with short timeout (for ack timeout check)
+                with _frame_cond:
+                    # Only wait if no new frame and not ready (or already caught up)
+                    if (_frame_seq == self.last_seq or not self.client_ready) \
+                            and not self._stop.is_set() and self.ws.connected:
+                        self._wake.clear()
+                        _frame_cond.wait(timeout=0.033)  # ~30fps check rate
+
+                # Also check per-session wake (for ack notification)
+                self._wake.wait(timeout=0.001)
+
+                if self._stop.is_set() or not self.ws.connected:
+                    break
+
+                self.process_messages()
+
+                if not self.client_ready:
+                    continue
+
+                frame, seq = state.get_raw()
+                if frame is None or seq == self.last_seq:
+                    continue
+
+                if not self._render_and_send(frame, seq):
+                    break
+        finally:
+            self._stop.set()
+            self._wake.set()
+            reader.join(timeout=1.0)
+
+
+@sock.route("/ws/panel")
+def ws_panel(ws):
+    session = PanelSession(ws)
+    session.run()
 
 
 # ---------------------------------------------------------------------------
@@ -1034,7 +1243,7 @@ def _port_in_use(port: int) -> bool:
 
 
 def main():
-    global hub, source
+    global hub, source, _stream_max_w, _stream_max_h
 
     parser = argparse.ArgumentParser(description="本地实时推理模拟 Web 应用")
     parser.add_argument("--cam", type=int, default=config.DEFAULT_CAM_INDEX, help="摄像头索引")
@@ -1044,18 +1253,47 @@ def main():
     parser.add_argument("--host", type=str, default=config.HOST, help="绑定地址")
     parser.add_argument("--source", type=str, default=None,
                         help="视频源覆盖: image:<path> 或 video:<path>（调试用，默认摄像头）")
+    parser.add_argument("--source-fps", type=float, default=0,
+                        help="视频源播放帧率覆盖（默认使用视频原速）")
     parser.add_argument("--list-cameras", action="store_true", help="列出可用摄像头并退出")
     parser.add_argument("--list-models", action="store_true", help="列出模型目录中的可用模型并退出")
     parser.add_argument("--hat-weights", type=str, default=config.HAT_WEIGHTS,
                         help="Real-HAT-GAN 权重路径（拍照即时；录像停后离线）")
     parser.add_argument("--fusion-root", type=str, default=config.FUSION_TOOL_ROOT,
                         help="Image-Tool 仓库本地克隆根目录（提供 network_hat.py）")
+    # Performance options
+    parser.add_argument("--fp16", action="store_true", default=config.USE_FP16,
+                        help="启用 FP16 半精度推理（仅 CUDA，默认开启）")
+    parser.add_argument("--no-fp16", dest="fp16", action="store_false",
+                        help="禁用 FP16，强制使用 FP32")
+    parser.add_argument("--stream-size", type=str, default=None,
+                        help="直播流最大尺寸 WxH（如 1280x1024），默认 1280x1024。设为 0 禁用缩放")
+    parser.add_argument("--stats", action="store_true", default=config.STATS_OVERLAY,
+                        help="启用统计叠加层（FPS/延迟）")
     args = parser.parse_args()
     config.HAT_WEIGHTS = args.hat_weights
     config.FUSION_TOOL_ROOT = args.fusion_root
     config.DEFAULT_DEVICE = args.device
+    config.USE_FP16 = args.fp16
+    config.STATS_OVERLAY = args.stats
     if not config.HAT_DEVICE:
         config.HAT_DEVICE = args.device
+
+    # Parse stream size
+    if args.stream_size:
+        if args.stream_size == "0":
+            _stream_max_w = 0
+            _stream_max_h = 0
+        else:
+            try:
+                w, h = map(int, args.stream_size.lower().split("x"))
+                _stream_max_w = w
+                _stream_max_h = h
+            except ValueError:
+                config.log(f"无效的 --stream-size 格式: {args.stream_size}，使用默认值")
+
+    # Set frame callback for WebSocket notification
+    state.frame_callback = _notify_frame
 
     # 端口冲突检测：已有实例在跑时直接退出，避免双实例抢相机/端口
     if _port_in_use(args.port):
@@ -1074,8 +1312,11 @@ def main():
         return
 
     # 模型注册表（先于摄像头，模型错误早暴露）
-    hub = ModelHub(args.models_dir, device=args.device)
+    use_fp16 = args.fp16 and args.device == "cuda"
+    hub = ModelHub(args.models_dir, device=args.device, use_fp16=use_fp16)
     config.log(f"模型目录: {args.models_dir} → {hub.names if hub.names else '(空)'}")
+    if use_fp16:
+        config.log("FP16 推理已启用")
     hat_ok, hat_detail = hat_backend.available()
     if hat_ok:
         config.log(f"HAT 可用（拍照即时 / 录像停后离线）: {hat_detail}")
@@ -1092,7 +1333,8 @@ def main():
 
     # 视频源（摄像头或文件）
     try:
-        source = FrameSource(state, cam_index=args.cam, source=args.source)
+        source = FrameSource(state, cam_index=args.cam, source=args.source,
+                             source_fps=args.source_fps)
         source.start()
     except Exception as exc:
         config.log(f"视频源启动失败: {exc}")
