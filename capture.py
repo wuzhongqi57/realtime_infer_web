@@ -123,9 +123,14 @@ def extract_yuy2_planes(frame: np.ndarray, cam_w: int, cam_h: int):
 
 
 class FrameSource:
-    """视频源。mode: 'camera' | 'image' | 'video'。运行在独立线程，持续写入 state。"""
+    """视频源。mode: 'camera' | 'image' | 'video'。运行在独立线程，持续写入 state。
 
-    def __init__(self, state: SharedState, cam_index: int = 0, source: str = None):
+    Video sources are paced to their embedded FPS (or --source-fps override)
+    for realistic testing. Camera and image sources are unchanged.
+    """
+
+    def __init__(self, state: SharedState, cam_index: int = 0, source: str = None,
+                 source_fps: float = 0):
         self.state = state
         self.cam_index = cam_index
         self.source = source          # None → camera；"image:<path>" | "video:<path>"
@@ -140,6 +145,8 @@ class FrameSource:
         self._paused = False
         self._pause_lock = threading.Lock()
         self._control_hold = threading.Event()
+        self._video_fps = 0.0         # Target FPS for video pacing
+        self._source_fps_override = source_fps  # User override
 
         if source:
             if source.startswith("image:"):
@@ -160,8 +167,21 @@ class FrameSource:
                     raise FileNotFoundError(f"无法打开视频源: {path}")
                 self.cam_w = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
                 self.cam_h = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                # Get video FPS for pacing
+                clip_fps = self._cap.get(cv2.CAP_PROP_FPS)
+                if source_fps > 0:
+                    self._video_fps = source_fps
+                    config.log(f"视频源: {path} ({self.cam_w}x{self.cam_h}), "
+                               f"播放帧率: {source_fps} fps (用户指定)")
+                elif clip_fps > 0:
+                    self._video_fps = clip_fps
+                    config.log(f"视频源: {path} ({self.cam_w}x{self.cam_h}), "
+                               f"播放帧率: {clip_fps:.1f} fps (视频原速)")
+                else:
+                    self._video_fps = 30.0  # Default fallback
+                    config.log(f"视频源: {path} ({self.cam_w}x{self.cam_h}), "
+                               f"播放帧率: 30 fps (默认)")
                 self.state.cam_size = (self.cam_w, self.cam_h)
-                config.log(f"视频源: {path} ({self.cam_w}x{self.cam_h})")
             else:
                 raise ValueError("--source 必须是 'image:<path>' 或 'video:<path>'")
 
@@ -241,13 +261,21 @@ class FrameSource:
                 gray = self._static_frame
                 uv = self._neutral_uv(gray.shape[0], gray.shape[1])
                 time.sleep(1.0 / 15.0)
-            else:  # video
+            else:  # video - paced to clip FPS for realistic testing
+                frame_start = time.perf_counter()
                 ok, frame = self._cap.read()
                 if not ok:
                     self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                     continue
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 uv = self._neutral_uv(gray.shape[0], gray.shape[1])
+                # Pace to video FPS
+                if self._video_fps > 0:
+                    target_interval = 1.0 / self._video_fps
+                    elapsed = time.perf_counter() - frame_start
+                    sleep_time = target_interval - elapsed
+                    if sleep_time > 0.001:
+                        time.sleep(sleep_time)
 
             if gray is None:
                 continue

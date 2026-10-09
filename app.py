@@ -210,6 +210,9 @@ def _render(name: str, frame: np.ndarray, seq: int,
     for_stream=True: 先缩放灰度到流尺寸，再上色（快）
     for_stream=False: 保持面板原尺寸，全分辨率上色
 
+    Optimizations for GIL: ensure arrays are contiguous before cv2 calls,
+    minimize intermediate allocations, release references early.
+
     Returns: (jpeg_bytes, inference_ms)
     """
     panel_w, panel_h = _get_panel_size()
@@ -217,33 +220,38 @@ def _render(name: str, frame: np.ndarray, seq: int,
     pal = view["effective"]
     infer_ms = 0.0
 
+    # Pre-compute stream size once
+    stream_w, stream_h = _compute_stream_size(panel_w, panel_h) if for_stream else (0, 0)
+
     def _fit_gray(y: np.ndarray, nearest: bool = False) -> np.ndarray:
         """Scale grayscale to panel size."""
         if panel_h and (y.shape[0], y.shape[1]) != (panel_h, panel_w):
             interp = cv2.INTER_NEAREST if nearest else cv2.INTER_LINEAR
+            # Ensure contiguous for cv2
+            y = np.ascontiguousarray(y)
             y = cv2.resize(y, (panel_w, panel_h), interpolation=interp)
         return y
 
     def _stream_scale_gray(y: np.ndarray) -> np.ndarray:
         """Scale grayscale to stream size."""
-        if not for_stream:
+        if not for_stream or not stream_w:
             return y
         h, w = y.shape[:2]
-        sw, sh = _compute_stream_size(w, h)
-        if (sw, sh) != (w, h):
-            interp = cv2.INTER_AREA if w > sw else cv2.INTER_LINEAR
-            y = cv2.resize(y, (sw, sh), interpolation=interp)
+        if (stream_w, stream_h) != (w, h):
+            interp = cv2.INTER_AREA if w > stream_w else cv2.INTER_LINEAR
+            y = np.ascontiguousarray(y)
+            y = cv2.resize(y, (stream_w, stream_h), interpolation=interp)
         return y
 
     def _stream_scale_bgr(bgr: np.ndarray) -> np.ndarray:
         """Scale BGR to stream size (for UV mode which produces BGR directly)."""
-        if not for_stream:
+        if not for_stream or not stream_w:
             return bgr
         h, w = bgr.shape[:2]
-        sw, sh = _compute_stream_size(w, h)
-        if (sw, sh) != (w, h):
-            interp = cv2.INTER_AREA if w > sw else cv2.INTER_LINEAR
-            bgr = cv2.resize(bgr, (sw, sh), interpolation=interp)
+        if (stream_w, stream_h) != (w, h):
+            interp = cv2.INTER_AREA if w > stream_w else cv2.INTER_LINEAR
+            bgr = np.ascontiguousarray(bgr)
+            bgr = cv2.resize(bgr, (stream_w, stream_h), interpolation=interp)
         return bgr
 
     # UV mode: uses lut_to_yuv which transforms Y already, need BGR scaling
@@ -254,7 +262,8 @@ def _render(name: str, frame: np.ndarray, seq: int,
         else:
             y_hr, infer_ms = hub.infer(name, y_fc, seq, cache_tag="uv:" + pal)
         bgr, _ = false_color.attach_uv(y_hr, u, v)
-        return _jpeg(_stream_scale_bgr(bgr)), infer_ms
+        bgr = _stream_scale_bgr(bgr)
+        return _jpeg(bgr), infer_ms
 
     # Raw or regular models: scale grayscale first, then apply palette (fast!)
     if name == config.RAW_LABEL:
@@ -284,6 +293,7 @@ def _render(name: str, frame: np.ndarray, seq: int,
     # Fit to panel if needed (for cross-resolution models)
     if panel_h and (sr_h, sr_w) != (panel_h, panel_w):
         interp = cv2.INTER_AREA if sr_h > panel_h else cv2.INTER_LINEAR
+        sr = np.ascontiguousarray(sr)
         sr = cv2.resize(sr, (panel_w, panel_h), interpolation=interp)
     # Scale grayscale to stream size FIRST, then apply palette (fast!)
     sr = _stream_scale_gray(sr)
@@ -296,7 +306,14 @@ def _render(name: str, frame: np.ndarray, seq: int,
 # ---------------------------------------------------------------------------
 
 class PanelSession:
-    """Per-panel WebSocket session with non-blocking control message handling."""
+    """Per-panel WebSocket session with non-blocking control message handling.
+
+    Flow control strategy: ack-on-receipt allows pipelining (server can render
+    next frame while client decodes), keeping latency flat at camera rate.
+    Server-side ack timeout (500ms) prevents stalls from lost acks.
+    """
+
+    ACK_TIMEOUT_MS = 500  # Reset client_ready if no ack received
 
     def __init__(self, ws):
         self.ws = ws
@@ -308,6 +325,8 @@ class PanelSession:
         self.stats_enabled = False
         self._stop = threading.Event()
         self._msg_queue: queue.Queue = queue.Queue()
+        self._wake = threading.Event()  # Per-session wake for ack
+        self._last_send_time = 0.0  # For ack timeout
 
     def reader_thread(self):
         """Read control messages from client without blocking render loop."""
@@ -317,15 +336,18 @@ class PanelSession:
                     msg = self.ws.receive(timeout=0.5)
                     if msg:
                         self._msg_queue.put(msg)
+                        self._wake.set()  # Wake render loop on any message
                 except Exception:
                     break
         except Exception:
             pass
         finally:
             self._stop.set()
+            self._wake.set()
 
-    def process_messages(self):
-        """Process queued control messages (non-blocking)."""
+    def process_messages(self) -> bool:
+        """Process queued control messages (non-blocking). Returns True if ack received."""
+        got_ack = False
         while True:
             try:
                 msg = self._msg_queue.get_nowait()
@@ -346,88 +368,117 @@ class PanelSession:
                     self.last_seq = 0
                 if d.get("ack"):
                     self.client_ready = True
+                    got_ack = True
                 if "stats" in d:
                     self.stats_enabled = bool(d["stats"])
             except Exception:
                 pass
+        return got_ack
+
+    def _render_and_send(self, frame: np.ndarray, seq: int) -> bool:
+        """Render frame and send. Returns True on success."""
+        view = _resolve_fc(self.fc_spec)
+        pal_key = f"{view['enabled']}:{view['effective']}:{view['mode']}"
+        if self.hat_hold.get("palette") != pal_key:
+            self.hat_hold = {"jpeg": None, "palette": pal_key}
+
+        # For heavy models with cached placeholder, just resend
+        if _is_heavy(self.selected) and self.hat_hold.get("jpeg") is not None:
+            data = self.hat_hold["jpeg"]
+            infer_ms = 0.0
+            render_ms = 0.0
+        else:
+            frame_time = time.perf_counter()
+            # Copy frame outside any global lock to minimize GIL contention
+            frame = np.ascontiguousarray(frame)
+            try:
+                data, infer_ms = _render(self.selected, frame, seq,
+                                         hat_hold=self.hat_hold, fc=self.fc_spec,
+                                         for_stream=True)
+                if self.hat_hold is not None:
+                    self.hat_hold["palette"] = pal_key
+            except Exception as exc:
+                config.log(f"渲染失败 ({self.selected}): {exc}")
+                return False
+            render_ms = (time.perf_counter() - frame_time) * 1000.0
+
+        if not data:
+            return False
+
+        # Build frame message with optional stats header (4-byte length prefix)
+        if self.stats_enabled:
+            stats = {
+                "seq": seq,
+                "render_ms": round(render_ms, 1),
+                "infer_ms": round(infer_ms, 1),
+                "ts": int(time.time() * 1000),
+            }
+            header = json.dumps(stats).encode()
+            # 4-byte little-endian length prefix + header + jpeg
+            prefix = len(header).to_bytes(4, "little")
+            data = prefix + header + data
+
+        try:
+            self.ws.send(data)
+            self.last_seq = seq
+            self.client_ready = False
+            self._last_send_time = time.perf_counter()
+            return True
+        except Exception:
+            return False
 
     def run(self):
-        """Main render loop - waits on frame condition instead of polling."""
+        """Main render loop - waits on frame condition or ack, whichever comes first."""
         global _frame_seq
         reader = threading.Thread(target=self.reader_thread, daemon=True)
         reader.start()
 
         try:
             while not self._stop.is_set() and self.ws.connected:
-                self.process_messages()
+                # Check for ack timeout - reset client_ready if no ack for too long
+                if not self.client_ready and self._last_send_time > 0:
+                    elapsed_ms = (time.perf_counter() - self._last_send_time) * 1000.0
+                    if elapsed_ms > self.ACK_TIMEOUT_MS:
+                        self.client_ready = True  # Assume ack lost, continue
 
-                # Wait for new frame OR client ack with timeout
+                got_ack = self.process_messages()
+
+                # On ack, immediately try to render newest frame if available
+                if got_ack:
+                    frame, seq = state.get_raw()
+                    if frame is not None and seq > self.last_seq:
+                        if not self._render_and_send(frame, seq):
+                            break
+                        continue
+
+                # Wait for new frame with short timeout (for ack timeout check)
                 with _frame_cond:
-                    while ((_frame_seq == self.last_seq) or (not self.client_ready)) \
-                            and (not self._stop.is_set()) and self.ws.connected:
-                        _frame_cond.wait(timeout=0.05)
-                        self.process_messages()
+                    # Only wait if no new frame and not ready (or already caught up)
+                    if (_frame_seq == self.last_seq or not self.client_ready) \
+                            and not self._stop.is_set() and self.ws.connected:
+                        self._wake.clear()
+                        _frame_cond.wait(timeout=0.033)  # ~30fps check rate
+
+                # Also check per-session wake (for ack notification)
+                self._wake.wait(timeout=0.001)
 
                 if self._stop.is_set() or not self.ws.connected:
                     break
+
+                self.process_messages()
+
+                if not self.client_ready:
+                    continue
 
                 frame, seq = state.get_raw()
                 if frame is None or seq == self.last_seq:
                     continue
 
-                view = _resolve_fc(self.fc_spec)
-                pal_key = f"{view['enabled']}:{view['effective']}:{view['mode']}"
-                if self.hat_hold.get("palette") != pal_key:
-                    self.hat_hold = {"jpeg": None, "palette": pal_key}
-                    self.last_seq = 0
-                    if seq == self.last_seq:
-                        continue
-
-                # For heavy models with cached placeholder, just resend
-                if _is_heavy(self.selected) and self.hat_hold.get("jpeg") is not None:
-                    self.last_seq = seq
-                    try:
-                        self.ws.send(self.hat_hold["jpeg"])
-                        self.client_ready = False
-                    except Exception:
-                        break
-                    continue
-
-                self.last_seq = seq
-                frame_time = time.perf_counter()
-
-                try:
-                    data, infer_ms = _render(self.selected, frame, seq,
-                                             hat_hold=self.hat_hold, fc=self.fc_spec,
-                                             for_stream=True)
-                    if self.hat_hold is not None:
-                        self.hat_hold["palette"] = pal_key
-                except Exception as exc:
-                    config.log(f"渲染失败 ({self.selected}): {exc}")
-                    continue
-
-                if not data:
-                    continue
-
-                # Build frame message with optional stats header
-                render_ms = (time.perf_counter() - frame_time) * 1000.0
-                if self.stats_enabled:
-                    stats = {
-                        "seq": seq,
-                        "render_ms": round(render_ms, 1),
-                        "infer_ms": round(infer_ms, 1),
-                        "ts": int(time.time() * 1000),
-                    }
-                    header = json.dumps(stats).encode() + b"\n"
-                    data = header + data
-
-                try:
-                    self.ws.send(data)
-                    self.client_ready = False
-                except Exception:
+                if not self._render_and_send(frame, seq):
                     break
         finally:
             self._stop.set()
+            self._wake.set()
             reader.join(timeout=1.0)
 
 
@@ -1202,6 +1253,8 @@ def main():
     parser.add_argument("--host", type=str, default=config.HOST, help="绑定地址")
     parser.add_argument("--source", type=str, default=None,
                         help="视频源覆盖: image:<path> 或 video:<path>（调试用，默认摄像头）")
+    parser.add_argument("--source-fps", type=float, default=0,
+                        help="视频源播放帧率覆盖（默认使用视频原速）")
     parser.add_argument("--list-cameras", action="store_true", help="列出可用摄像头并退出")
     parser.add_argument("--list-models", action="store_true", help="列出模型目录中的可用模型并退出")
     parser.add_argument("--hat-weights", type=str, default=config.HAT_WEIGHTS,
@@ -1280,7 +1333,8 @@ def main():
 
     # 视频源（摄像头或文件）
     try:
-        source = FrameSource(state, cam_index=args.cam, source=args.source)
+        source = FrameSource(state, cam_index=args.cam, source=args.source,
+                             source_fps=args.source_fps)
         source.start()
     except Exception as exc:
         config.log(f"视频源启动失败: {exc}")

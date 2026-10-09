@@ -244,24 +244,45 @@
       statsEl.textContent = `FPS: ${displayFps} | 渲染: ${render}ms | 推理: ${infer}ms | 延迟: ${age}ms`;
     }
 
+    function sendAck() {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ ack: true }));
+      }
+    }
+
     function processFrame(data) {
+      // Ack on receipt (before decode) to allow pipelining - server can
+      // start rendering next frame while we decode this one
+      sendAck();
+
       if (decoding) {
         pendingData = data;  // Drop: keep only newest
         return;
       }
       decoding = true;
 
-      // Parse stats header if present (JSON line before JPEG)
+      // Parse stats header if present (4-byte little-endian length prefix)
       let stats = null, jpegData = data;
-      if (data instanceof ArrayBuffer) {
+      if (data instanceof ArrayBuffer && data.byteLength > 4) {
         const arr = new Uint8Array(data);
-        const nlIdx = arr.indexOf(10);  // newline
-        if (nlIdx > 0 && nlIdx < 200) {
+        const dv = new DataView(data);
+        const headerLen = dv.getUint32(0, true);  // little-endian
+        if (headerLen > 0 && headerLen < 500 && 4 + headerLen < data.byteLength) {
           try {
-            const headerStr = new TextDecoder().decode(arr.slice(0, nlIdx));
+            const headerStr = new TextDecoder().decode(arr.slice(4, 4 + headerLen));
             stats = JSON.parse(headerStr);
-            jpegData = arr.slice(nlIdx + 1).buffer;
-          } catch (e) {}
+            jpegData = arr.slice(4 + headerLen).buffer;
+          } catch (e) {
+            // Fallback: try legacy newline format for compatibility
+            const nlIdx = arr.indexOf(10);
+            if (nlIdx > 0 && nlIdx < 200) {
+              try {
+                const headerStr = new TextDecoder().decode(arr.slice(0, nlIdx));
+                stats = JSON.parse(headerStr);
+                jpegData = arr.slice(nlIdx + 1).buffer;
+              } catch (e2) {}
+            }
+          }
         }
       }
 
@@ -271,21 +292,12 @@
         ctx.drawImage(bmp, 0, 0, canvas.width, canvas.height);
         bmp.close();
         updateStats(stats);
-
-        // Send ack for flow control
-        if (ws && ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ ack: true }));
-        }
-
+      }).catch(err => {
+        // Decode error - frame corrupted or invalid
+        console.warn('Frame decode error:', err);
+      }).finally(() => {
         decoding = false;
         // Process pending frame if any (newest only)
-        if (pendingData) {
-          const next = pendingData;
-          pendingData = null;
-          processFrame(next);
-        }
-      }).catch(() => {
-        decoding = false;
         if (pendingData) {
           const next = pendingData;
           pendingData = null;

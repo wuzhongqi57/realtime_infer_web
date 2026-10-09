@@ -153,22 +153,29 @@ def effective_palette() -> str:
 
 
 def _get_lut_3ch(pid: str) -> np.ndarray:
-    """Get or create a (256,1,3) LUT suitable for cv2.LUT on a 3-channel image."""
+    """Get or create a (256,1,3) LUT suitable for cv2.LUT on a 3-channel image.
+
+    The LUT is stored contiguous for optimal cv2.LUT performance.
+    """
     key = f"_3ch_{pid}"
     if key not in _luts:
         table = _luts[pid]  # (256, 3) BGR
-        _luts[key] = table.reshape(256, 1, 3)
+        lut = np.ascontiguousarray(table.reshape(256, 1, 3))
+        _luts[key] = lut
     return _luts[key]
 
 
 def apply_to_bgr(y: np.ndarray, palette: str | None = None) -> np.ndarray:
     """Y (H,W) uint8 → 预览用 BGR。
 
-    Uses cv2.LUT for fast colormap application.
+    Uses cv2.LUT for fast colormap application. Optimized to minimize
+    allocations and ensure contiguous arrays for cv2 calls.
     """
     ensure_luts()
     pid = normalize_palette(palette if palette is not None else effective_palette())
-    y = np.asarray(y, dtype=np.uint8)
+    # Ensure contiguous uint8 for cv2 operations
+    if not y.flags['C_CONTIGUOUS'] or y.dtype != np.uint8:
+        y = np.ascontiguousarray(y, dtype=np.uint8)
     if pid == "black_hot":
         y = 255 - y
         return yuv_codec.gray_to_bgr(y)
