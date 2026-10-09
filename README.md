@@ -67,6 +67,18 @@ Windows 也可双击 `run.bat` / `run_gpu.bat`（请先按脚本内说明改好�
 | `--hat-weights PATH` | Real-HAT-GAN 权重 | Image-Tool 仓库 `model_zoo/hat/...` |
 | `--fusion-root PATH` | Image-Tool 仓库本地克隆（提供 `network_hat.py`） | 同级 `image_fusion_tool` 目录 |
 
+### 性能调优参数
+
+| 参数 | 说明 | 默认 |
+|------|------|------|
+| `--fp16` / `--no-fp16` | 启用/禁用 FP16 半精度推理（仅 CUDA） | `--fp16`（CUDA 时默认开启） |
+| `--stream-size WxH` | 直播流最大尺寸（如 `1280x1024`），超出时等比缩放 | `1280x1024` |
+| `--stream-size 0` | 禁用流缩放，以面板原尺寸推流 | — |
+| `--stats` | 启动时显示统计叠加层 | 关闭 |
+
+FP16 推理在 CUDA 上可减少约 50% 推理时间，输出差异通常 < 0.5 灰度级。
+流缩放将 2560x2048 面板缩至 1280x1024 后再 JPEG 编码，可减少编码时间约 70%、带宽约 60%。
+
 ## 界面说明
 
 - 页头可切换面板数量（1～3）
@@ -75,6 +87,7 @@ Windows 也可双击 `run.bat` / `run_gpu.bat`（请先按脚本内说明改好�
 - 原图放大到面板用最近邻；模型结果缩放到面板仍用双线性
 - 选中 `HAT×4` 时直播仅显示占位提示；拍照会即时超分；录像过程中不跑 HAT（避免卡死），停止后弹出进度条对原图录像离线超分
 - 页头可开关**伪彩**并选择调色板；关伪彩=白热（仅 Y）；拍照默认附带 `.yuy2` 原始帧，便于逐字节对照
+- **📊 统计**按钮或 `?stats=1` URL 参数可显示每面板的 FPS、渲染耗时、推理耗时及端到端延迟
 
 ## 伪彩查找表
 
@@ -106,6 +119,23 @@ conda run -n ir_realtime python -c "import false_color; false_color.ensure_luts(
 3. 上电后短暂预热并丢弃空帧
 
 若仍无画面：先用 `--list-cameras` 确认索引，再试 `--cam N`，或改用 `--source image:...` / `video:...` 验证推理链路。
+
+## 性能基准测试
+
+使用 `tools/bench_stream.py` 可在本地测量各阶段耗时：
+
+```bash
+# 测试所有模型（CPU）
+python tools/bench_stream.py --models-dir /path/to/models
+
+# 测试特定模型，含 FP16（GPU）
+python tools/bench_stream.py --models-dir /path/to/models --model mymodel --device cuda --fp16
+```
+
+输出包括：
+- 各色彩映射（ironbow、white_hot 等）的 LUT 应用时间
+- 不同尺寸的 resize 和 JPEG 编码时间
+- FP32/FP16 推理时间及精度差异
 
 ## 已知事项
 

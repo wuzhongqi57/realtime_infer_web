@@ -17,9 +17,11 @@
 import argparse
 import json
 import os
+import queue
 import re
 import threading
 import time
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -51,6 +53,32 @@ hub = None
 source = None          # 全局视频源（拍照/录像/相机控制 API 使用）
 _cached_cam_key = None         # 面板尺寸按相机分辨率缓存（更换相机时才重算）
 _panel_size = (0, 0)
+
+# Stream size for live view (downscaled for bandwidth, full res for snapshots/recordings)
+_stream_max_w = config.STREAM_MAX_WIDTH
+_stream_max_h = config.STREAM_MAX_HEIGHT
+
+# Frame condition for efficient waiting (instead of polling)
+_frame_cond = threading.Condition()
+_frame_seq = 0
+
+
+def _notify_frame():
+    """Notify all WebSocket threads that a new frame is available."""
+    global _frame_seq
+    with _frame_cond:
+        _frame_seq += 1
+        _frame_cond.notify_all()
+
+
+def _compute_stream_size(src_w: int, src_h: int) -> tuple[int, int]:
+    """Compute stream output size that fits within max bounds while preserving aspect."""
+    if not _stream_max_w or not _stream_max_h:
+        return src_w, src_h
+    if src_w <= _stream_max_w and src_h <= _stream_max_h:
+        return src_w, src_h
+    scale = min(_stream_max_w / src_w, _stream_max_h / src_h)
+    return int(src_w * scale), int(src_h * scale)
 
 
 def _get_panel_size() -> tuple[int, int]:
@@ -175,16 +203,34 @@ def _jpeg(frame: np.ndarray) -> bytes:
 
 
 def _render(name: str, frame: np.ndarray, seq: int,
-            hat_hold: dict | None = None, fc: dict | None = None) -> bytes:
-    """按面板选择渲染一帧为 JPEG。伪彩设置来自该面板，不共用全局。"""
+            hat_hold: dict | None = None, fc: dict | None = None,
+            for_stream: bool = True) -> tuple[bytes, float]:
+    """按面板选择渲染一帧为 JPEG。伪彩设置来自该面板，不共用全局。
+
+    for_stream=True: 缩放到流尺寸 (STREAM_MAX_*)
+    for_stream=False: 保持面板原尺寸
+
+    Returns: (jpeg_bytes, inference_ms)
+    """
     panel_w, panel_h = _get_panel_size()
     view = _resolve_fc(fc)
     pal = view["effective"]
+    infer_ms = 0.0
 
     def _fit(bgr: np.ndarray, nearest: bool = False) -> np.ndarray:
         if panel_h and (bgr.shape[0], bgr.shape[1]) != (panel_h, panel_w):
             interp = cv2.INTER_NEAREST if nearest else cv2.INTER_LINEAR
             bgr = cv2.resize(bgr, (panel_w, panel_h), interpolation=interp)
+        return bgr
+
+    def _stream_scale(bgr: np.ndarray) -> np.ndarray:
+        if not for_stream:
+            return bgr
+        h, w = bgr.shape[:2]
+        sw, sh = _compute_stream_size(w, h)
+        if (sw, sh) != (w, h):
+            interp = cv2.INTER_AREA if w > sw else cv2.INTER_LINEAR
+            bgr = cv2.resize(bgr, (sw, sh), interpolation=interp)
         return bgr
 
     if name == config.RAW_LABEL or (view["mode"] == "uv" and not _is_heavy(name)):
@@ -193,90 +239,173 @@ def _render(name: str, frame: np.ndarray, seq: int,
             if name == config.RAW_LABEL:
                 y_hr = y_fc
             else:
-                y_hr, _ = hub.infer(name, y_fc, seq, cache_tag="uv:" + pal)
+                y_hr, infer_ms = hub.infer(name, y_fc, seq, cache_tag="uv:" + pal)
             bgr, _ = false_color.attach_uv(y_hr, u, v)
         else:
             bgr = false_color.apply_to_bgr(frame, pal)
-        # 原图放大到面板用最近邻，避免双线性抹掉像素块
-        return _jpeg(_fit(bgr, nearest=(name == config.RAW_LABEL)))
+        bgr = _fit(bgr, nearest=(name == config.RAW_LABEL))
+        return _jpeg(_stream_scale(bgr)), infer_ms
     if _is_heavy(name):
         if hat_hold is not None:
             if hat_hold.get("jpeg") is None:
                 ph = hat_backend.make_placeholder(frame, (panel_w, panel_h))
                 if ph.ndim == 2:
                     ph = false_color.apply_to_bgr(ph, pal)
-                hat_hold["jpeg"] = _jpeg(ph)
-            return hat_hold["jpeg"] or b""
+                hat_hold["jpeg"] = _jpeg(_stream_scale(ph))
+            return hat_hold["jpeg"] or b"", 0.0
         ph = hat_backend.make_placeholder(frame, (panel_w, panel_h))
         if ph.ndim == 2:
             ph = false_color.apply_to_bgr(ph, pal)
-        return _jpeg(ph)
-    sr, _ = hub.infer(name, frame, seq)
+        return _jpeg(_stream_scale(ph)), 0.0
+    sr, infer_ms = hub.infer(name, frame, seq)
     bgr = false_color.apply_to_bgr(sr, pal)
-    return _jpeg(_fit(bgr))
+    return _jpeg(_stream_scale(_fit(bgr))), infer_ms
 
 
 # ---------------------------------------------------------------------------
 # WebSocket — 单一面板流（二进制 JPEG 帧）
 # ---------------------------------------------------------------------------
-@sock.route("/ws/panel")
-def ws_panel(ws):
-    selected = config.RAW_LABEL
-    last_seq = 0
-    fc_spec = {"enabled": False, "palette": "ironbow", "mode": "lut"}
-    hat_hold = {"jpeg": None, "palette": None}
-    while ws.connected:
-        msg = ws.receive(timeout=0.02)
-        if msg:
+
+class PanelSession:
+    """Per-panel WebSocket session with non-blocking control message handling."""
+
+    def __init__(self, ws):
+        self.ws = ws
+        self.selected = config.RAW_LABEL
+        self.fc_spec = {"enabled": False, "palette": "ironbow", "mode": "lut"}
+        self.hat_hold = {"jpeg": None, "palette": None}
+        self.last_seq = 0
+        self.client_ready = True  # Flow control: client has acked last frame
+        self.stats_enabled = False
+        self._stop = threading.Event()
+        self._msg_queue: queue.Queue = queue.Queue()
+
+    def reader_thread(self):
+        """Read control messages from client without blocking render loop."""
+        try:
+            while not self._stop.is_set() and self.ws.connected:
+                try:
+                    msg = self.ws.receive(timeout=0.5)
+                    if msg:
+                        self._msg_queue.put(msg)
+                except Exception:
+                    break
+        except Exception:
+            pass
+        finally:
+            self._stop.set()
+
+    def process_messages(self):
+        """Process queued control messages (non-blocking)."""
+        while True:
+            try:
+                msg = self._msg_queue.get_nowait()
+            except queue.Empty:
+                break
             try:
                 d = json.loads(msg)
                 allowed = [config.RAW_LABEL] + _selectable_names()
                 if d.get("model") in allowed:
                     new_sel = d["model"]
-                    if new_sel != selected:
-                        selected = new_sel
-                        hat_hold = {"jpeg": None, "palette": None}
-                        last_seq = 0
+                    if new_sel != self.selected:
+                        self.selected = new_sel
+                        self.hat_hold = {"jpeg": None, "palette": None}
+                        self.last_seq = 0
                 if isinstance(d.get("false_color"), dict):
-                    fc_spec = d["false_color"]
-                    hat_hold = {"jpeg": None, "palette": None}
-                    last_seq = 0
+                    self.fc_spec = d["false_color"]
+                    self.hat_hold = {"jpeg": None, "palette": None}
+                    self.last_seq = 0
+                if d.get("ack"):
+                    self.client_ready = True
+                if "stats" in d:
+                    self.stats_enabled = bool(d["stats"])
             except Exception:
                 pass
 
-        frame, seq = state.get_raw()
-        if frame is None:
-            continue
-        view = _resolve_fc(fc_spec)
-        pal_key = f"{view['enabled']}:{view['effective']}:{view['mode']}"
-        if hat_hold.get("palette") != pal_key:
-            hat_hold = {"jpeg": None, "palette": pal_key}
-            last_seq = 0
+    def run(self):
+        """Main render loop - waits on frame condition instead of polling."""
+        global _frame_seq
+        reader = threading.Thread(target=self.reader_thread, daemon=True)
+        reader.start()
 
-        if _is_heavy(selected) and hat_hold.get("jpeg") is not None:
-            if seq == last_seq:
-                continue
-            last_seq = seq
-            try:
-                ws.send(hat_hold["jpeg"])
-            except Exception:
-                break
-            continue
-        if seq == last_seq:
-            continue
-        last_seq = seq
         try:
-            data = _render(selected, frame, seq, hat_hold=hat_hold, fc=fc_spec)
-            if hat_hold is not None:
-                hat_hold["palette"] = pal_key
-        except Exception as exc:
-            config.log(f"渲染失败 ({selected}): {exc}")
-            continue
-        if data:
-            try:
-                ws.send(data)
-            except Exception:
-                break
+            while not self._stop.is_set() and self.ws.connected:
+                self.process_messages()
+
+                # Wait for new frame OR client ack with timeout
+                with _frame_cond:
+                    while ((_frame_seq == self.last_seq) or (not self.client_ready)) \
+                            and (not self._stop.is_set()) and self.ws.connected:
+                        _frame_cond.wait(timeout=0.05)
+                        self.process_messages()
+
+                if self._stop.is_set() or not self.ws.connected:
+                    break
+
+                frame, seq = state.get_raw()
+                if frame is None or seq == self.last_seq:
+                    continue
+
+                view = _resolve_fc(self.fc_spec)
+                pal_key = f"{view['enabled']}:{view['effective']}:{view['mode']}"
+                if self.hat_hold.get("palette") != pal_key:
+                    self.hat_hold = {"jpeg": None, "palette": pal_key}
+                    self.last_seq = 0
+                    if seq == self.last_seq:
+                        continue
+
+                # For heavy models with cached placeholder, just resend
+                if _is_heavy(self.selected) and self.hat_hold.get("jpeg") is not None:
+                    self.last_seq = seq
+                    try:
+                        self.ws.send(self.hat_hold["jpeg"])
+                        self.client_ready = False
+                    except Exception:
+                        break
+                    continue
+
+                self.last_seq = seq
+                frame_time = time.perf_counter()
+
+                try:
+                    data, infer_ms = _render(self.selected, frame, seq,
+                                             hat_hold=self.hat_hold, fc=self.fc_spec,
+                                             for_stream=True)
+                    if self.hat_hold is not None:
+                        self.hat_hold["palette"] = pal_key
+                except Exception as exc:
+                    config.log(f"渲染失败 ({self.selected}): {exc}")
+                    continue
+
+                if not data:
+                    continue
+
+                # Build frame message with optional stats header
+                render_ms = (time.perf_counter() - frame_time) * 1000.0
+                if self.stats_enabled:
+                    stats = {
+                        "seq": seq,
+                        "render_ms": round(render_ms, 1),
+                        "infer_ms": round(infer_ms, 1),
+                        "ts": int(time.time() * 1000),
+                    }
+                    header = json.dumps(stats).encode() + b"\n"
+                    data = header + data
+
+                try:
+                    self.ws.send(data)
+                    self.client_ready = False
+                except Exception:
+                    break
+        finally:
+            self._stop.set()
+            reader.join(timeout=1.0)
+
+
+@sock.route("/ws/panel")
+def ws_panel(ws):
+    session = PanelSession(ws)
+    session.run()
 
 
 # ---------------------------------------------------------------------------
@@ -1034,7 +1163,7 @@ def _port_in_use(port: int) -> bool:
 
 
 def main():
-    global hub, source
+    global hub, source, _stream_max_w, _stream_max_h
 
     parser = argparse.ArgumentParser(description="本地实时推理模拟 Web 应用")
     parser.add_argument("--cam", type=int, default=config.DEFAULT_CAM_INDEX, help="摄像头索引")
@@ -1050,12 +1179,39 @@ def main():
                         help="Real-HAT-GAN 权重路径（拍照即时；录像停后离线）")
     parser.add_argument("--fusion-root", type=str, default=config.FUSION_TOOL_ROOT,
                         help="Image-Tool 仓库本地克隆根目录（提供 network_hat.py）")
+    # Performance options
+    parser.add_argument("--fp16", action="store_true", default=config.USE_FP16,
+                        help="启用 FP16 半精度推理（仅 CUDA，默认开启）")
+    parser.add_argument("--no-fp16", dest="fp16", action="store_false",
+                        help="禁用 FP16，强制使用 FP32")
+    parser.add_argument("--stream-size", type=str, default=None,
+                        help="直播流最大尺寸 WxH（如 1280x1024），默认 1280x1024。设为 0 禁用缩放")
+    parser.add_argument("--stats", action="store_true", default=config.STATS_OVERLAY,
+                        help="启用统计叠加层（FPS/延迟）")
     args = parser.parse_args()
     config.HAT_WEIGHTS = args.hat_weights
     config.FUSION_TOOL_ROOT = args.fusion_root
     config.DEFAULT_DEVICE = args.device
+    config.USE_FP16 = args.fp16
+    config.STATS_OVERLAY = args.stats
     if not config.HAT_DEVICE:
         config.HAT_DEVICE = args.device
+
+    # Parse stream size
+    if args.stream_size:
+        if args.stream_size == "0":
+            _stream_max_w = 0
+            _stream_max_h = 0
+        else:
+            try:
+                w, h = map(int, args.stream_size.lower().split("x"))
+                _stream_max_w = w
+                _stream_max_h = h
+            except ValueError:
+                config.log(f"无效的 --stream-size 格式: {args.stream_size}，使用默认值")
+
+    # Set frame callback for WebSocket notification
+    state.frame_callback = _notify_frame
 
     # 端口冲突检测：已有实例在跑时直接退出，避免双实例抢相机/端口
     if _port_in_use(args.port):
@@ -1074,8 +1230,11 @@ def main():
         return
 
     # 模型注册表（先于摄像头，模型错误早暴露）
-    hub = ModelHub(args.models_dir, device=args.device)
+    use_fp16 = args.fp16 and args.device == "cuda"
+    hub = ModelHub(args.models_dir, device=args.device, use_fp16=use_fp16)
     config.log(f"模型目录: {args.models_dir} → {hub.names if hub.names else '(空)'}")
+    if use_fp16:
+        config.log("FP16 推理已启用")
     hat_ok, hat_detail = hat_backend.available()
     if hat_ok:
         config.log(f"HAT 可用（拍照即时 / 录像停后离线）: {hat_detail}")

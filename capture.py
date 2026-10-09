@@ -37,6 +37,7 @@ class SharedState:
         self.sr_seq = 0            # 已处理的帧序号
         self.sr_ms = 0.0           # 最近一次推理耗时(ms)
         self.infer_fps = 0.0       # 实际推理帧率
+        self.frame_callback = None  # Optional callback on new frame
 
     def set_raw(self, frame: np.ndarray, uv: np.ndarray | None = None) -> None:
         with self._lock:
@@ -46,6 +47,12 @@ class SharedState:
                 uv = np.full((h, w, 2), 128, dtype=np.uint8)
             self.raw_uv = uv
             self.raw_seq += 1
+        # Notify waiters (outside lock to avoid holding it during callback)
+        if self.frame_callback:
+            try:
+                self.frame_callback()
+            except Exception:
+                pass
 
     def get_raw(self) -> tuple:
         """返回 (Y, seq)。兼容旧调用。"""
